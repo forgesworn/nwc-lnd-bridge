@@ -203,7 +203,7 @@ const isMain = import.meta.url === pathToFileURL(process.argv[1] || '').href
 async function main() {
   const { generateSecretKey, getPublicKey, finalizeEvent } = await import('nostr-tools/pure')
   const { getConversationKey, encrypt, decrypt } = await import('nostr-tools/nip44')
-  const { SimplePool } = await import('nostr-tools/pool')
+  const { Relay } = await import('nostr-tools/relay')
 
   const hexToBytes = (hex) => Uint8Array.from(Buffer.from(hex, 'hex'))
   const bytesToHex = (bytes) => Buffer.from(bytes).toString('hex')
@@ -288,7 +288,32 @@ async function main() {
     }, bridgeSecret)
   }
 
-  const pool = new SimplePool()
+  // One connection per relay, via the Relay class directly. SimplePool's
+  // subscribeMany serialised the subscription filter in a way both nostr-rs-relay
+  // and primal rejected; Relay.subscribe sends a plain REQ every relay accepts.
+  // A misbehaving relay is logged and skipped, never fatal, and a stray async
+  // error from any relay must not take down a funds-adjacent service.
+  process.on('unhandledRejection', (e) => console.error('unhandledRejection:', (e && e.message) || e))
+  process.on('uncaughtException', (e) => console.error('uncaughtException:', (e && e.message) || e))
+
+  const conns = []
+  for (const url of relays) {
+    try {
+      const relay = await Relay.connect(url)
+      conns.push({ url, relay })
+      console.log(`Connected to ${url}`)
+    } catch (err) {
+      console.warn(`WARN: could not connect to ${url}: ${err.message}`)
+    }
+  }
+  if (conns.length === 0) {
+    console.error('No relay connected; exiting')
+    process.exit(1)
+  }
+
+  const publishAll = (event) =>
+    Promise.allSettled(conns.map(({ url, relay }) =>
+      Promise.resolve(relay.publish(event)).catch((err) => console.warn(`publish to ${url} failed: ${err.message}`))))
 
   // Publish the replaceable kind 13194 info event to every relay. A strict
   // NIP-44-only client refuses a wallet that advertises no encryption tag, so
@@ -301,50 +326,46 @@ async function main() {
     tags: infoTags,
     content: [...allowedMethods].join(' '),
   }, bridgeSecret)
-  await Promise.allSettled(pool.publish(relays, infoEvent))
-  console.log(`Published info event (kind 13194) to ${relays.length} relay(s): ${[...allowedMethods].join(' ')}`)
+  await publishAll(infoEvent)
+  console.log(`Published info event (kind 13194) to ${conns.length} relay(s): ${[...allowedMethods].join(' ')}`)
 
   // Dedupe across relays: the same request can arrive on several of them, and
   // make_invoice is not idempotent, so a duplicate would mint a second invoice.
   const seen = new Set()
-
-  const sub = pool.subscribeMany(
-    relays,
-    [{ kinds: [23194], authors: [clientPubkey], '#p': [bridgePubkey], since: nowSec() - 10 }],
-    {
-      onevent: async (event) => {
-        // Only the connection's own client may drive this wallet, and only once
-        // per event id however many relays deliver it. The author filter and the
-        // pubkey re-check make the client secret a real credential; without them
-        // a pay-enabled URI would honour anyone.
-        if (event.pubkey !== clientPubkey) return
-        if (seen.has(event.id)) return
-        seen.add(event.id)
-        if (seen.size > 5000) seen.clear()
-        let request
+  const onRequest = async (event) => {
+    // Only the connection's own client may drive this wallet, and only once per
+    // event id however many relays deliver it. The author filter and this
+    // re-check make the client secret a real credential; without them a
+    // pay-enabled URI would honour anyone.
+    if (event.pubkey !== clientPubkey) return
+    if (seen.has(event.id)) return
+    seen.add(event.id)
+    if (seen.size > 5000) seen.clear()
+    let request
+    try {
+      request = decryptRequest(event)
+      console.log(`NWC request: ${request.method}`)
+      const result = await handle(request.method, request.params || {})
+      await publishAll(buildResponse(event, request.method, result))
+      console.log('  -> response published')
+    } catch (err) {
+      console.error(`  -> error: ${err.message}`)
+      if (request) {
         try {
-          request = decryptRequest(event)
-          console.log(`NWC request: ${request.method}`)
-          const result = await handle(request.method, request.params || {})
-          await Promise.allSettled(pool.publish(relays, buildResponse(event, request.method, result)))
-          console.log('  -> response published')
-        } catch (err) {
-          console.error(`  -> error: ${err.message}`)
-          if (request) {
-            try {
-              await Promise.allSettled(pool.publish(relays, buildResponse(event, request.method, null, err)))
-            } catch { /* ignore double-error */ }
-          }
-        }
-      },
-    },
-  )
+          await publishAll(buildResponse(event, request.method, null, err))
+        } catch { /* ignore double-error */ }
+      }
+    }
+  }
+
+  const filter = { kinds: [23194], authors: [clientPubkey], '#p': [bridgePubkey], since: nowSec() - 10 }
+  const subs = conns.map(({ relay }) => relay.subscribe([filter], { onevent: onRequest }))
 
   console.log('Listening for NWC requests...\n')
   process.on('SIGINT', () => {
     console.log('\nShutting down...')
-    sub.close()
-    pool.close(relays)
+    for (const s of subs) { try { s.close() } catch { /* ignore */ } }
+    for (const { relay } of conns) { try { relay.close() } catch { /* ignore */ } }
     process.exit(0)
   })
 }
