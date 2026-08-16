@@ -35,6 +35,22 @@ import { readFileSync } from 'node:fs'
 // Invoice-only. No pay_invoice (spend), no get_balance (disclosure).
 export const DEFAULT_METHODS = ['make_invoice', 'lookup_invoice', 'list_transactions', 'get_info']
 
+// RELAY may be a single URL or a whitespace/comma-separated list. Serving the
+// connection on several relays makes it resilient: a request delivered on any
+// one is enough, so no single relay is a point of failure. Dedupes and drops
+// anything that is not a ws(s):// URL.
+export function parseRelays(input) {
+  const seen = new Set()
+  const out = []
+  for (const raw of String(input || '').split(/[\s,]+/)) {
+    const url = raw.trim()
+    if (!url || !/^wss?:\/\//i.test(url) || seen.has(url)) continue
+    seen.add(url)
+    out.push(url)
+  }
+  return out
+}
+
 // NIP-47 error codes used below. Anything unexpected collapses to OTHER.
 export function nwcError(code, message) {
   const error = new Error(message)
@@ -187,14 +203,18 @@ const isMain = import.meta.url === pathToFileURL(process.argv[1] || '').href
 async function main() {
   const { generateSecretKey, getPublicKey, finalizeEvent } = await import('nostr-tools/pure')
   const { getConversationKey, encrypt, decrypt } = await import('nostr-tools/nip44')
-  const { Relay } = await import('nostr-tools/relay')
+  const { SimplePool } = await import('nostr-tools/pool')
 
   const hexToBytes = (hex) => Uint8Array.from(Buffer.from(hex, 'hex'))
   const bytesToHex = (bytes) => Buffer.from(bytes).toString('hex')
 
   const LND_REST_URL = (process.env.LND_REST_URL || 'https://127.0.0.1:8080').replace(/\/$/, '')
   const LND_MACAROON = process.env.LND_MACAROON
-  const RELAY_URL = process.env.RELAY || 'wss://relay.damus.io'
+  const relays = parseRelays(process.env.RELAY || 'wss://relay.damus.io')
+  if (relays.length === 0) {
+    console.error('RELAY must contain at least one ws:// or wss:// URL')
+    process.exit(1)
+  }
   const methods = (process.env.NWC_METHODS || DEFAULT_METHODS.join(' ')).split(/\s+/).filter(Boolean)
   const allowedMethods = new Set(methods)
 
@@ -235,7 +255,8 @@ async function main() {
   const clientSecret = process.env.CLIENT_SECRET ? hexToBytes(process.env.CLIENT_SECRET) : generateSecretKey()
   const clientPubkey = getPublicKey(clientSecret)
 
-  const nwcUri = `nostr+walletconnect://${bridgePubkey}?relay=${encodeURIComponent(RELAY_URL)}&secret=${bytesToHex(clientSecret)}`
+  const relayParams = relays.map((r) => `relay=${encodeURIComponent(r)}`).join('&')
+  const nwcUri = `nostr+walletconnect://${bridgePubkey}?${relayParams}&secret=${bytesToHex(clientSecret)}`
   const spends = allowedMethods.has('pay_invoice')
   console.log('\nNWC URI:')
   console.log(nwcUri)
@@ -243,7 +264,7 @@ async function main() {
   console.log(`Capability: ${spends ? 'CAN SPEND (pay_invoice enabled)' : 'invoice-only (cannot spend)'}`)
   console.log(`Bridge pubkey: ${bridgePubkey}`)
   console.log(`Client pubkey: ${clientPubkey}`)
-  console.log(`Relay: ${RELAY_URL}`)
+  console.log(`Relays: ${relays.join(', ')}`)
   console.log(`LND: ${LND_REST_URL}\n`)
   if (!process.env.BRIDGE_SECRET) {
     console.log(`BRIDGE_SECRET=${bytesToHex(bridgeSecret)}`)
@@ -267,43 +288,51 @@ async function main() {
     }, bridgeSecret)
   }
 
-  const relay = await Relay.connect(RELAY_URL)
-  console.log(`Connected to ${RELAY_URL}`)
+  const pool = new SimplePool()
 
-  // Publish the replaceable kind 13194 info event. A strict NIP-44-only client
-  // refuses a wallet that advertises no encryption tag, so this is required for
-  // discovery, not optional. Advertise exactly the allowlist.
-  const tags = [['encryption', 'nip44_v2']]
-  if (allowedMethods.has('list_transactions')) tags.push(['extensions', '05'])
-  await relay.publish(finalizeEvent({
+  // Publish the replaceable kind 13194 info event to every relay. A strict
+  // NIP-44-only client refuses a wallet that advertises no encryption tag, so
+  // this is required for discovery, not optional. Advertise exactly the allowlist.
+  const infoTags = [['encryption', 'nip44_v2']]
+  if (allowedMethods.has('list_transactions')) infoTags.push(['extensions', '05'])
+  const infoEvent = finalizeEvent({
     kind: 13194,
     created_at: nowSec(),
-    tags,
+    tags: infoTags,
     content: [...allowedMethods].join(' '),
-  }, bridgeSecret))
-  console.log(`Published info event (kind 13194): ${[...allowedMethods].join(' ')}`)
+  }, bridgeSecret)
+  await Promise.allSettled(pool.publish(relays, infoEvent))
+  console.log(`Published info event (kind 13194) to ${relays.length} relay(s): ${[...allowedMethods].join(' ')}`)
 
-  const sub = relay.subscribe(
+  // Dedupe across relays: the same request can arrive on several of them, and
+  // make_invoice is not idempotent, so a duplicate would mint a second invoice.
+  const seen = new Set()
+
+  const sub = pool.subscribeMany(
+    relays,
     [{ kinds: [23194], authors: [clientPubkey], '#p': [bridgePubkey], since: nowSec() - 10 }],
     {
       onevent: async (event) => {
-        // Only the connection's own client may drive this wallet. The relay
-        // filter already restricts authors; re-check here in case a relay
-        // ignores it, so the client secret is a real credential rather than a
-        // hint. Without this a pay-enabled URI would honour anyone.
+        // Only the connection's own client may drive this wallet, and only once
+        // per event id however many relays deliver it. The author filter and the
+        // pubkey re-check make the client secret a real credential; without them
+        // a pay-enabled URI would honour anyone.
         if (event.pubkey !== clientPubkey) return
+        if (seen.has(event.id)) return
+        seen.add(event.id)
+        if (seen.size > 5000) seen.clear()
         let request
         try {
           request = decryptRequest(event)
           console.log(`NWC request: ${request.method}`)
           const result = await handle(request.method, request.params || {})
-          await relay.publish(buildResponse(event, request.method, result))
+          await Promise.allSettled(pool.publish(relays, buildResponse(event, request.method, result)))
           console.log('  -> response published')
         } catch (err) {
           console.error(`  -> error: ${err.message}`)
           if (request) {
             try {
-              await relay.publish(buildResponse(event, request.method, null, err))
+              await Promise.allSettled(pool.publish(relays, buildResponse(event, request.method, null, err)))
             } catch { /* ignore double-error */ }
           }
         }
@@ -315,7 +344,7 @@ async function main() {
   process.on('SIGINT', () => {
     console.log('\nShutting down...')
     sub.close()
-    relay.close()
+    pool.close(relays)
     process.exit(0)
   })
 }

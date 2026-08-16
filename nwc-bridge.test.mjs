@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createHandler, mapInvoice, base64ToHex, DEFAULT_METHODS } from './nwc-bridge.mjs'
+import { createHandler, mapInvoice, base64ToHex, parseRelays, DEFAULT_METHODS } from './nwc-bridge.mjs'
 
 const b64 = (byte) => Buffer.alloc(32, byte).toString('base64')
 const hex = (byte) => byte.toString(16).padStart(2, '0').repeat(32)
@@ -142,6 +142,15 @@ test('an entirely unknown method is RESTRICTED before it can reach the node', as
   const handle = createHandler({ lnd: async () => { touched = true; return {} }, allowedMethods: DEFAULT_METHODS })
   await assert.rejects(handle('sign_message', {}), expectCode('RESTRICTED'))
   assert.equal(touched, false)
+})
+
+test('parseRelays splits on whitespace/commas, filters non-ws, and dedupes', () => {
+  assert.deepEqual(parseRelays('wss://a.example'), ['wss://a.example'])
+  assert.deepEqual(parseRelays('wss://a.example wss://b.example'), ['wss://a.example', 'wss://b.example'])
+  assert.deepEqual(parseRelays('wss://a.example, wss://b.example , wss://a.example'), ['wss://a.example', 'wss://b.example'])
+  assert.deepEqual(parseRelays('not-a-relay wss://ok.example http://nope.example'), ['wss://ok.example'])
+  assert.deepEqual(parseRelays(''), [])
+  assert.deepEqual(parseRelays(undefined), [])
 })
 
 test('mapInvoice treats a CANCELED invoice as failed', () => {

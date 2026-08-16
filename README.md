@@ -72,7 +72,7 @@ the same URI across restarts.
 | `LND_REST_URL` | `https://127.0.0.1:8080` | LND REST endpoint |
 | `LND_MACAROON` | (required) | Hex-encoded macaroon; invoice-only for a funds node |
 | `LND_CERT_PATH` / `LND_CERT` | none | LND `tls.cert` (path, or inline PEM / base64). If absent, TLS verification is off, acceptable only on localhost/docker |
-| `RELAY` | `wss://relay.damus.io` | Relay to serve NWC on |
+| `RELAY` | `wss://relay.damus.io` | Relay(s) to serve NWC on. One URL, or several separated by spaces or commas, for resilience |
 | `NWC_METHODS` | invoice-only set | Space-separated method allowlist |
 | `BRIDGE_SECRET` / `CLIENT_SECRET` | random | Hex 32-byte keys; set to persist the URI |
 
