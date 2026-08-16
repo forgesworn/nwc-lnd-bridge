@@ -1,0 +1,32 @@
+# NWC-to-LND bridge. Fronts an EXISTING LND node; it does not run one.
+#
+# The emitted NWC URI is a capability over that node. For a funds-holding node
+# (e.g. a mint's LND), bake an invoice-only macaroon and leave NWC_METHODS blank
+# so the bridge stays invoice-only. See README.md.
+#
+# To reach an LND that runs in another compose project, attach this service to
+# that project's network (uncomment `networks` below and set LND_REST_URL to the
+# LND container name, e.g. https://lnurl-mint-lnd-1:8080).
+
+services:
+  nwc-lnd-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile.nwc
+    container_name: nwc-lnd-bridge
+    restart: unless-stopped
+    environment:
+      - LND_REST_URL=${LND_REST_URL:-https://host.docker.internal:8080}
+      - LND_MACAROON=${LND_MACAROON}          # hex; invoice-only for a funds node
+      - LND_CERT=${LND_CERT:-}                 # base64 or PEM of tls.cert (recommended)
+      - RELAY=${NWC_RELAY:-wss://relay.damus.io}
+      - NWC_METHODS=${NWC_METHODS:-}           # blank = invoice-only default
+      - BRIDGE_SECRET=${BRIDGE_SECRET:-}
+      - CLIENT_SECRET=${CLIENT_SECRET:-}
+#    networks:
+#      - mint
+
+#networks:
+#  mint:
+#    external: true
+#    name: lnurl-mint_default

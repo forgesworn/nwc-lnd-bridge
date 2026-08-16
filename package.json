@@ -1,0 +1,21 @@
+{
+  "name": "nwc-lnd-bridge",
+  "version": "0.1.0",
+  "description": "Minimal NIP-47 (Nostr Wallet Connect) wallet service in front of an LND node, with an invoice-only default capability.",
+  "type": "module",
+  "bin": {
+    "nwc-lnd-bridge": "nwc-bridge.mjs"
+  },
+  "scripts": {
+    "start": "node nwc-bridge.mjs",
+    "test": "node --test"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "nostr-tools": "^2.7.0",
+    "undici": "^6.19.8"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

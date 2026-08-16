@@ -1,0 +1,7 @@
+node_modules/
+.env
+*.macaroon
+*.cert
+*.pem
+dist/
+.DS_Store
