@@ -164,6 +164,12 @@ The request-handling core has no third-party imports and is tested against a
 fake LND, covering the allowlist guard, the invoice-only default, `pay_invoice`
 safety and the LND-to-NWC mapping.
 
+## Security
+
+Report vulnerabilities privately through the
+[security advisory form](https://github.com/forgesworn/nwc-lnd-bridge/security/advisories/new).
+See [SECURITY.md](SECURITY.md).
+
 ## Support
 
 For issues and feature requests, see [GitHub Issues](https://github.com/forgesworn/nwc-lnd-bridge/issues).

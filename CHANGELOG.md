@@ -36,6 +36,7 @@
   peers and invoices. They get the HTTP status only, and the trimmed body goes
   to the operator's log. Unexpected errors, including Node system errors with
   codes such as `ECONNREFUSED`, reach the client as a bare `INTERNAL`.
+- Add `SECURITY.md` with the private reporting route.
 - The Docker image installs from the lockfile with `npm ci --omit=dev` and runs
   as the unprivileged `node` user, which owns the `/data` directory.
 
