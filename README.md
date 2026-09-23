@@ -118,6 +118,15 @@ The request-handling core has no third-party imports and is tested against a
 fake LND, covering the allowlist guard, the invoice-only default, `pay_invoice`
 safety and the LND-to-NWC mapping.
 
-## License
+## Support
+
+For issues and feature requests, see [GitHub Issues](https://github.com/forgesworn/nwc-lnd-bridge/issues).
+
+If nwc-lnd-bridge is useful to you, a tip is always welcome:
+
+- Lightning: `profusemeat89@walletofsatoshi.com`
+- Nostr zaps: `npub1mgvlrnf5hm9yf0n5mf9nqmvarhvxkc6remu5ec3vf8r0txqkuk7su0e7q2`
+
+## Licence
 
 MIT
