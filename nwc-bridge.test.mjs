@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createHandler, mapInvoice, base64ToHex, parseRelays, DEFAULT_METHODS } from './nwc-bridge.mjs'
+import { createHandler, mapInvoice, base64ToHex, parseRelays, allowUnverifiedTls, DEFAULT_METHODS } from './nwc-bridge.mjs'
 
 const b64 = (byte) => Buffer.alloc(32, byte).toString('base64')
 const hex = (byte) => byte.toString(16).padStart(2, '0').repeat(32)
@@ -157,4 +157,16 @@ test('mapInvoice treats a CANCELED invoice as failed', () => {
   const res = mapInvoice({ state: 'CANCELED', r_hash: b64(0x03), payment_request: 'lnbc1c' })
   assert.equal(res.state, 'failed')
   assert.equal(res.preimage, '')
+})
+
+test('allowUnverifiedTls permits loopback only, unless LND_TLS_INSECURE=1', () => {
+  assert.equal(allowUnverifiedTls('https://127.0.0.1:8080'), true)
+  assert.equal(allowUnverifiedTls('https://localhost:8080'), true)
+  assert.equal(allowUnverifiedTls('https://[::1]:8080'), true)
+  assert.equal(allowUnverifiedTls('https://host.docker.internal:8080'), false)
+  assert.equal(allowUnverifiedTls('https://lnd.example.com:8080'), false)
+  assert.equal(allowUnverifiedTls('https://127.0.0.1.evil.example:8080'), false)
+  assert.equal(allowUnverifiedTls('not a url'), false)
+  assert.equal(allowUnverifiedTls('https://lnd.example.com:8080', '1'), true)
+  assert.equal(allowUnverifiedTls('https://lnd.example.com:8080', 'true'), false)
 })
