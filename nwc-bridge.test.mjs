@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process'
 import { mkdtempSync, readFileSync, statSync, writeFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createHandler, mapInvoice, base64ToHex, parseRelays, allowUnverifiedTls, watchRelayLiveness, parseMsat, isExpired, parseMethods, SUPPORTED_METHODS, loadOrCreateKeys, writePrivateFile, fingerprint, DEFAULT_METHODS } from './nwc-bridge.mjs'
+import { createHandler, mapInvoice, base64ToHex, parseRelays, allowUnverifiedTls, watchRelayLiveness, parseMsat, isExpired, parseMethods, SUPPORTED_METHODS, relayRejection, loadOrCreateKeys, writePrivateFile, fingerprint, DEFAULT_METHODS } from './nwc-bridge.mjs'
 
 const b64 = (byte) => Buffer.alloc(32, byte).toString('base64')
 const hex = (byte) => byte.toString(16).padStart(2, '0').repeat(32)
@@ -492,4 +492,32 @@ test('parseMethods defaults to invoice-only and accepts supported opt-ins', () =
   assert.deepEqual([...parseMethods(undefined)], DEFAULT_METHODS)
   assert.deepEqual([...parseMethods('make_invoice pay_invoice,get_info')], ['make_invoice', 'pay_invoice', 'get_info'])
   assert.throws(() => parseMethods('sign_message'), /unsupported/)
+})
+
+test('relays must be wss://, except ws:// on loopback', () => {
+  assert.equal(relayRejection('wss://relay.example'), undefined)
+  assert.equal(relayRejection('ws://127.0.0.1:7777'), undefined)
+  assert.equal(relayRejection('ws://localhost:7777'), undefined)
+  assert.equal(relayRejection('ws://[::1]:7777'), undefined)
+  assert.match(relayRejection('ws://relay.example'), /loopback/)
+  assert.match(relayRejection('ws://127.0.0.1.evil.example'), /loopback/)
+  assert.ok(relayRejection('http://relay.example'))
+  assert.ok(relayRejection('not a url'))
+  assert.deepEqual(parseRelays('ws://relay.example wss://ok.example ws://127.0.0.1:1'), ['wss://ok.example', 'ws://127.0.0.1:1'])
+})
+
+test('the bridge refuses to start with a plaintext remote relay', async () => {
+  const child = spawn(process.execPath, ['nwc-bridge.mjs'], {
+    cwd: new URL('.', import.meta.url),
+    env: bridgeTestEnv({ RELAY: 'wss://relay.example ws://relay.example' }),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  let stderr = ''
+  child.stderr.on('data', (chunk) => { stderr += chunk })
+  const code = await new Promise((resolve) => {
+    const timer = setTimeout(() => { child.kill('SIGKILL'); resolve('timeout') }, 10_000)
+    child.on('exit', (exitCode) => { clearTimeout(timer); resolve(exitCode) })
+  })
+  assert.equal(code, 1)
+  assert.match(stderr, /ws:\/\/relay\.example refused/)
 })

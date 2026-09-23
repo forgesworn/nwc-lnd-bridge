@@ -104,7 +104,7 @@ from the environment.
 | `LND_MACAROON` | (required) | Hex-encoded macaroon; invoice-only for a funds node |
 | `LND_CERT_PATH` / `LND_CERT` | none | LND `tls.cert` (path, or inline PEM / base64). Required unless LND is on loopback |
 | `LND_TLS_INSECURE` | unset | `1` skips TLS verification for a non-loopback LND without a cert. The macaroon crosses that link in every request, so only on a network you trust |
-| `RELAY` | `wss://relay.damus.io` | Relay(s) to serve NWC on. One URL, or several separated by spaces or commas, for resilience |
+| `RELAY` | `wss://relay.damus.io` | Relay(s) to serve NWC on. One URL, or several separated by spaces or commas, for resilience. `wss://` only; `ws://` is accepted on loopback |
 | `NWC_METHODS` | invoice-only set | Space-separated method allowlist from `make_invoice lookup_invoice get_info get_balance pay_invoice` |
 | `MAX_PAY_MSAT` | none | Per-payment cap in msat. Required when `pay_invoice` is enabled |
 | `FEE_LIMIT_MSAT` | none | Routing fee ceiling per payment in msat. Required when `pay_invoice` is enabled |

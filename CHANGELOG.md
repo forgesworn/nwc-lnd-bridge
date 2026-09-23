@@ -30,6 +30,8 @@
   answered a different question from the one asked. It is removed from the
   default allowlist, and `NWC_METHODS` now refuses any method the bridge does
   not implement instead of advertising it.
+- Accept only `wss://` relays, except `ws://` on loopback. The bridge refuses
+  to start with a plaintext remote relay rather than dropping it silently.
 - The Docker image installs from the lockfile with `npm ci --omit=dev` and runs
   as the unprivileged `node` user, which owns the `/data` directory.
 

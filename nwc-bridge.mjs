@@ -54,16 +54,34 @@ export function parseMethods(input) {
   return new Set(methods)
 }
 
+export function isLoopbackHost(host) {
+  return host === 'localhost' || host === '[::1]' || /^127\.\d+\.\d+\.\d+$/.test(host)
+}
+
+/**
+ * Why a relay URL is refused, or undefined if it is acceptable. Plain ws://
+ * is only allowed on loopback: the requests are NIP-44 encrypted, but their
+ * metadata (who, when, how often) and the relay's authenticity are not, and a
+ * wallet service has no reason to give those away.
+ */
+export function relayRejection(url) {
+  let parsed
+  try { parsed = new URL(url) } catch { return 'not a URL' }
+  if (parsed.protocol === 'wss:') return undefined
+  if (parsed.protocol === 'ws:') return isLoopbackHost(parsed.hostname) ? undefined : 'ws:// is only allowed on loopback; use wss://'
+  return 'not a ws(s):// URL'
+}
+
 // RELAY may be a single URL or a whitespace/comma-separated list. Serving the
 // connection on several relays makes it resilient: a request delivered on any
 // one is enough, so no single relay is a point of failure. Dedupes and drops
-// anything that is not a ws(s):// URL.
+// anything relayRejection refuses; main() refuses to start if any was dropped.
 export function parseRelays(input) {
   const seen = new Set()
   const out = []
   for (const raw of String(input || '').split(/[\s,]+/)) {
     const url = raw.trim()
-    if (!url || !/^wss?:\/\//i.test(url) || seen.has(url)) continue
+    if (!url || relayRejection(url) || seen.has(url)) continue
     seen.add(url)
     out.push(url)
   }
@@ -78,7 +96,7 @@ export function allowUnverifiedTls(lndUrl, insecureFlag) {
   if (insecureFlag === '1') return true
   let host
   try { host = new URL(lndUrl).hostname } catch { return false }
-  return host === 'localhost' || host === '[::1]' || /^127\.\d+\.\d+\.\d+$/.test(host)
+  return isLoopbackHost(host)
 }
 
 export function nwcError(code, message) {
@@ -392,9 +410,16 @@ async function main() {
 
   const LND_REST_URL = (process.env.LND_REST_URL || 'https://127.0.0.1:8080').replace(/\/$/, '')
   const LND_MACAROON = process.env.LND_MACAROON
-  const relays = parseRelays(process.env.RELAY || 'wss://relay.damus.io')
+  const relayInput = process.env.RELAY || 'wss://relay.damus.io'
+  const refused = String(relayInput).split(/[\s,]+/).filter(Boolean)
+    .map((url) => [url, relayRejection(url)]).filter(([, reason]) => reason)
+  if (refused.length > 0) {
+    for (const [url, reason] of refused) console.error(`RELAY ${url} refused: ${reason}`)
+    process.exit(1)
+  }
+  const relays = parseRelays(relayInput)
   if (relays.length === 0) {
-    console.error('RELAY must contain at least one ws:// or wss:// URL')
+    console.error('RELAY must contain at least one wss:// URL')
     process.exit(1)
   }
   let allowedMethods
