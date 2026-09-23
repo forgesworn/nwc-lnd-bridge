@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process'
 import { mkdtempSync, readFileSync, statSync, writeFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createHandler, mapInvoice, base64ToHex, parseRelays, allowUnverifiedTls, watchRelayLiveness, parseMsat, isExpired, parseMethods, SUPPORTED_METHODS, relayRejection, loadOrCreateKeys, writePrivateFile, fingerprint, DEFAULT_METHODS } from './nwc-bridge.mjs'
+import { createHandler, mapInvoice, base64ToHex, parseRelays, allowUnverifiedTls, watchRelayLiveness, parseMsat, isExpired, parseMethods, SUPPORTED_METHODS, relayRejection, createLndClient, responseError, nwcError, loadOrCreateKeys, writePrivateFile, fingerprint, DEFAULT_METHODS } from './nwc-bridge.mjs'
 
 const b64 = (byte) => Buffer.alloc(32, byte).toString('base64')
 const hex = (byte) => byte.toString(16).padStart(2, '0').repeat(32)
@@ -520,4 +520,40 @@ test('the bridge refuses to start with a plaintext remote relay', async () => {
   })
   assert.equal(code, 1)
   assert.match(stderr, /ws:\/\/relay\.example refused/)
+})
+
+test('an LND error reaches the NWC client as a status code, not LND\'s body', async () => {
+  const logged = []
+  const body = JSON.stringify({ code: 2, message: 'unable to find channel 812345x1x0 with peer 03abc@10.0.0.7:9735' })
+  const lnd = createLndClient({
+    baseUrl: 'https://lnd.test',
+    macaroon: 'ab',
+    fetchImpl: async () => new Response(body, { status: 500 }),
+    log: (line) => logged.push(line),
+  })
+  const err = await lnd('GET', '/v1/payreq/lnbc1secretinvoice').catch((e) => e)
+  const sent = responseError(err)
+  assert.deepEqual(sent, { code: 'INTERNAL', message: 'LND request failed (HTTP 500)' })
+  assert.equal(logged.length, 1)
+  assert.doesNotMatch(logged[0], /lnbc1secretinvoice/)
+})
+
+test('responseError passes deliberate errors through and hides everything else', () => {
+  assert.deepEqual(responseError(nwcError('QUOTA_EXCEEDED', 'too much')), { code: 'QUOTA_EXCEEDED', message: 'too much' })
+  assert.equal(responseError(nwcError('OTHER', 'x'.repeat(1000))).message.length, 256)
+  const system = Object.assign(new Error('connect ECONNREFUSED 10.0.0.7:8080'), { code: 'ECONNREFUSED' })
+  assert.deepEqual(responseError(system), { code: 'INTERNAL', message: 'internal error' })
+  assert.deepEqual(responseError(new SyntaxError('Unexpected token < in JSON')), { code: 'INTERNAL', message: 'internal error' })
+})
+
+test('an unreachable or garbled LND is reported without detail', async () => {
+  const quiet = () => {}
+  const unreachable = createLndClient({ baseUrl: 'https://lnd.test', macaroon: 'ab', log: quiet,
+    fetchImpl: async () => { throw new Error('connect ECONNREFUSED 10.0.0.7:8080') } })
+  assert.deepEqual(responseError(await unreachable('GET', '/v1/getinfo').catch((e) => e)),
+    { code: 'INTERNAL', message: 'LND request failed' })
+  const garbled = createLndClient({ baseUrl: 'https://lnd.test', macaroon: 'ab', log: quiet,
+    fetchImpl: async () => new Response('<html>proxy error</html>', { status: 200 }) })
+  assert.deepEqual(responseError(await garbled('GET', '/v1/getinfo').catch((e) => e)),
+    { code: 'INTERNAL', message: 'LND returned an unreadable response' })
 })

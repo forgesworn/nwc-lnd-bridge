@@ -32,6 +32,10 @@
   not implement instead of advertising it.
 - Accept only `wss://` relays, except `ws://` on loopback. The bridge refuses
   to start with a plaintext remote relay rather than dropping it silently.
+- NWC clients no longer receive LND's error bodies, which can name channels,
+  peers and invoices. They get the HTTP status only, and the trimmed body goes
+  to the operator's log. Unexpected errors, including Node system errors with
+  codes such as `ECONNREFUSED`, reach the client as a bare `INTERNAL`.
 - The Docker image installs from the lockfile with `npm ci --omit=dev` and runs
   as the unprivileged `node` user, which owns the `/data` directory.
 

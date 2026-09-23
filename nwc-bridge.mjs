@@ -102,7 +102,58 @@ export function allowUnverifiedTls(lndUrl, insecureFlag) {
 export function nwcError(code, message) {
   const error = new Error(message)
   error.code = code
+  error.nwc = true
   return error
+}
+
+const MAX_CLIENT_MESSAGE = 256
+
+/**
+ * The error half of a NIP-47 response. Only errors this bridge raised on
+ * purpose pass their code and message through. Anything else (a Node system
+ * error, a JSON parse failure, a bug) could carry hostnames, paths or node
+ * internals, so the client gets a bare INTERNAL. Its `code` is never trusted
+ * either: Node's own errors carry codes like ECONNREFUSED.
+ */
+export function responseError(err) {
+  if (err && err.nwc === true) {
+    return { code: err.code, message: String(err.message).slice(0, MAX_CLIENT_MESSAGE) }
+  }
+  return { code: 'INTERNAL', message: 'internal error' }
+}
+
+/**
+ * LND REST client. A failure reaches the NWC client as a status code only.
+ * LND's error bodies name internal state (channel ids, peer addresses, invoice
+ * details) and belong in the operator's log, trimmed, not in a response.
+ */
+export function createLndClient({ baseUrl, macaroon, dispatcher, fetchImpl = fetch, log = console.error }) {
+  return async (httpMethod, path, body) => {
+    const opts = { method: httpMethod, headers: { 'Grpc-Metadata-macaroon': macaroon }, dispatcher }
+    if (body !== undefined) {
+      opts.headers['Content-Type'] = 'application/json'
+      opts.body = JSON.stringify(body)
+    }
+    const route = path.split('/').slice(0, 3).join('/')
+    let res, text
+    try {
+      res = await fetchImpl(`${baseUrl}${path}`, opts)
+      text = await res.text()
+    } catch (err) {
+      log(`lnd ${httpMethod} ${route}: request failed: ${String((err && err.message) || err).slice(0, 200)}`)
+      throw nwcError('INTERNAL', 'LND request failed')
+    }
+    if (!res.ok) {
+      log(`lnd ${httpMethod} ${route}: HTTP ${res.status}: ${text.slice(0, 200)}`)
+      throw nwcError('INTERNAL', `LND request failed (HTTP ${res.status})`)
+    }
+    try {
+      return text ? JSON.parse(text) : {}
+    } catch {
+      log(`lnd ${httpMethod} ${route}: unreadable response`)
+      throw nwcError('INTERNAL', 'LND returned an unreadable response')
+    }
+  }
 }
 
 // LND REST encodes hashes and preimages as standard base64; NWC wants hex.
@@ -452,17 +503,7 @@ async function main() {
   const dispatcher = new Agent({ connect: caPem ? { ca: caPem } : { rejectUnauthorized: false } })
   if (!caPem) console.warn('WARNING: no LND_CERT(_PATH) given, TLS verification is OFF (localhost/docker only)')
 
-  const lnd = async (httpMethod, path, body) => {
-    const opts = { method: httpMethod, headers: { 'Grpc-Metadata-macaroon': LND_MACAROON }, dispatcher }
-    if (body !== undefined) {
-      opts.headers['Content-Type'] = 'application/json'
-      opts.body = JSON.stringify(body)
-    }
-    const res = await fetch(`${LND_REST_URL}${path}`, opts)
-    const text = await res.text()
-    if (!res.ok) throw nwcError('INTERNAL', `lnd ${path}: ${res.status} ${text}`)
-    return text ? JSON.parse(text) : {}
-  }
+  const lnd = createLndClient({ baseUrl: LND_REST_URL, macaroon: LND_MACAROON, dispatcher })
 
   let maxPayMsat, feeLimitMsat
   try {
@@ -515,7 +556,7 @@ async function main() {
   const buildResponse = (requestEvent, resultType, result, error) => {
     const key = getConversationKey(bridgeSecret, requestEvent.pubkey)
     const payload = { result_type: resultType }
-    if (error) payload.error = { code: error.code || 'OTHER', message: error.message }
+    if (error) payload.error = responseError(error)
     else payload.result = result
     return finalizeEvent({
       kind: 23195,
