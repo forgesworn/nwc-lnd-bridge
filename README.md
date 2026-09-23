@@ -119,7 +119,7 @@ from the environment.
 
 | NIP-47 method | LND REST |
 | --- | --- |
-| `make_invoice` | `POST /v1/invoices` (`value_msat`) |
+| `make_invoice` | `POST /v1/invoices` (`value_msat`, `description_hash`) |
 | `lookup_invoice` | `GET /v1/invoice/{payment_hash}` |
 | `list_transactions` | `GET /v1/invoices?reversed=true` |
 | `get_info` | `GET /v1/getinfo` |

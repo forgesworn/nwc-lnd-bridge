@@ -115,6 +115,19 @@ test('make_invoice maps r_hash to hex and sends value_msat as a string', async (
   assert.equal(calls[0].body.memo, 'coffee')
 })
 
+test('make_invoice passes description_hash to LND as base64 of its bytes', async () => {
+  const { lnd, calls } = fakeLnd({
+    'POST /v1/invoices': { r_hash: b64(0xab), payment_request: 'lnbc1hash' },
+  })
+  const handle = createHandler({ lnd, allowedMethods: DEFAULT_METHODS })
+  const res = await handle('make_invoice', { amount: 1000, description_hash: hex(0xcd).toUpperCase() })
+  assert.equal(calls[0].body.description_hash, b64(0xcd))
+  assert.equal(res.description_hash, hex(0xcd))
+
+  await assert.rejects(handle('make_invoice', { amount: 1000, description_hash: 'abcd' }), expectCode('OTHER'))
+  assert.equal(calls.length, 1)
+})
+
 test('make_invoice omits value_msat for a zero (amountless) invoice', async () => {
   const { lnd, calls } = fakeLnd({
     'POST /v1/invoices': { r_hash: b64(0x01), payment_request: 'lnbc1any' },

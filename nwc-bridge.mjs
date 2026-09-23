@@ -259,6 +259,16 @@ export function createHandler({ lnd, allowedMethods, maxPayMsat, feeLimitMsat })
         // Omit value_msat for a zero amount so LND mints an amountless invoice
         // rather than rejecting it.
         if (amountMsat > 0) body.value_msat = String(amountMsat)
+        // LND commits to description_hash in the invoice's h field. REST takes
+        // the 32 bytes as base64; NIP-47 sends them as hex.
+        let descriptionHash
+        if (params.description_hash !== undefined && params.description_hash !== null && params.description_hash !== '') {
+          if (typeof params.description_hash !== 'string' || !HEX_32.test(params.description_hash)) {
+            throw nwcError('OTHER', 'description_hash must be 32-byte hex')
+          }
+          descriptionHash = params.description_hash.toLowerCase()
+          body.description_hash = Buffer.from(descriptionHash, 'hex').toString('base64')
+        }
         const inv = await lnd('POST', '/v1/invoices', body)
         return {
           type: 'incoming',
@@ -266,6 +276,7 @@ export function createHandler({ lnd, allowedMethods, maxPayMsat, feeLimitMsat })
           payment_hash: base64ToHex(inv.r_hash),
           amount: amountMsat,
           ...(params.description ? { description: params.description } : {}),
+          ...(descriptionHash ? { description_hash: descriptionHash } : {}),
           created_at: nowSec(),
         }
       }
