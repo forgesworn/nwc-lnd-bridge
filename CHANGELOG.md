@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Exit with status 1 when every relay subscription has closed. The bridge
+  previously stayed up after a relay drop, deaf to every request, because
+  nostr-tools does not reconnect by default. SIGTERM now shuts down cleanly.
+
 ## 0.1.0
 
 First tagged version. Run from source or Docker; not published to npm.

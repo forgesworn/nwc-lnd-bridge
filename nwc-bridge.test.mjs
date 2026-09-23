@@ -1,6 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createHandler, mapInvoice, base64ToHex, parseRelays, allowUnverifiedTls, DEFAULT_METHODS } from './nwc-bridge.mjs'
+import { createServer } from 'node:http'
+import { createHash } from 'node:crypto'
+import { spawn } from 'node:child_process'
+import { createHandler, mapInvoice, base64ToHex, parseRelays, allowUnverifiedTls, watchRelayLiveness, DEFAULT_METHODS } from './nwc-bridge.mjs'
 
 const b64 = (byte) => Buffer.alloc(32, byte).toString('base64')
 const hex = (byte) => byte.toString(16).padStart(2, '0').repeat(32)
@@ -17,6 +20,70 @@ function fakeLnd(routes) {
     return typeof handler === 'function' ? handler(body) : handler
   }
   return { lnd, calls }
+}
+
+// Environment for running the real bridge process with no LND behind it. The
+// runtime only calls LND when a request arrives, so startup needs none.
+function bridgeTestEnv(extra = {}) {
+  return {
+    PATH: process.env.PATH,
+    LND_REST_URL: 'https://127.0.0.1:1',
+    LND_MACAROON: 'ab'.repeat(16),
+    ...extra,
+  }
+}
+
+// A just-big-enough WebSocket relay for driving the real process: text frames
+// only, which is all NIP-01 uses. `drop()` destroys the TCP socket without a
+// close frame, which is how a relay restart or network loss looks.
+async function startTestRelay(onMessage) {
+  const sockets = new Set()
+  const server = createServer()
+  server.on('upgrade', (req, socket) => {
+    const accept = createHash('sha1')
+      .update(req.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
+      .digest('base64')
+    socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
+      `Sec-WebSocket-Accept: ${accept}\r\n\r\n`)
+    sockets.add(socket)
+    socket.on('close', () => sockets.delete(socket))
+    socket.on('error', () => {})
+    const relay = {
+      send(message) {
+        const payload = Buffer.from(JSON.stringify(message))
+        const header = payload.length < 126
+          ? Buffer.from([0x81, payload.length])
+          : Buffer.from([0x81, 126, payload.length >> 8, payload.length & 0xff])
+        socket.write(Buffer.concat([header, payload]))
+      },
+      drop() { socket.destroy() },
+    }
+    let buffer = Buffer.alloc(0)
+    socket.on('data', (chunk) => {
+      buffer = Buffer.concat([buffer, chunk])
+      while (buffer.length >= 2) {
+        let length = buffer[1] & 0x7f
+        let offset = 2
+        if (length === 126) { length = buffer.readUInt16BE(2); offset = 4 }
+        else if (length === 127) { length = Number(buffer.readBigUInt64BE(2)); offset = 10 }
+        if (buffer.length < offset + 4 + length) return
+        const mask = buffer.subarray(offset, offset + 4)
+        const payload = Buffer.from(buffer.subarray(offset + 4, offset + 4 + length))
+        for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i % 4]
+        const opcode = buffer[0] & 0x0f
+        buffer = buffer.subarray(offset + 4 + length)
+        if (opcode === 0x1) onMessage(JSON.parse(payload.toString('utf8')), relay)
+      }
+    })
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  return {
+    url: `ws://127.0.0.1:${server.address().port}`,
+    close() {
+      for (const socket of sockets) socket.destroy()
+      server.close()
+    },
+  }
 }
 
 const expectCode = (code) => (err) => {
@@ -169,4 +236,41 @@ test('allowUnverifiedTls permits loopback only, unless LND_TLS_INSECURE=1', () =
   assert.equal(allowUnverifiedTls('not a url'), false)
   assert.equal(allowUnverifiedTls('https://lnd.example.com:8080', '1'), true)
   assert.equal(allowUnverifiedTls('https://lnd.example.com:8080', 'true'), false)
+})
+
+test('watchRelayLiveness fires once, only when the last relay subscription closes', () => {
+  let fired = 0
+  const watch = watchRelayLiveness(['wss://a.example', 'wss://b.example'], () => { fired++ })
+  watch.closed('wss://a.example')
+  assert.equal(fired, 0)
+  assert.deepEqual(watch.live, ['wss://b.example'])
+  watch.closed('wss://a.example') // a repeat close of a dead relay changes nothing
+  assert.equal(fired, 0)
+  watch.closed('wss://b.example')
+  assert.equal(fired, 1)
+  watch.closed('wss://b.example')
+  assert.equal(fired, 1)
+})
+
+test('the bridge exits non-zero when its only relay drops', async () => {
+  // Drive the real runtime against a local relay that closes the socket as
+  // soon as the REQ arrives. Before the fix the process stayed up, deaf.
+  const server = await startTestRelay((message, relay) => {
+    if (message[0] === 'EVENT') relay.send(['OK', message[1].id, true, ''])
+    if (message[0] === 'REQ') setTimeout(() => relay.drop(), 50)
+  })
+  const child = spawn(process.execPath, ['nwc-bridge.mjs'], {
+    cwd: new URL('.', import.meta.url),
+    env: { ...bridgeTestEnv(), RELAY: server.url },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  let stderr = ''
+  child.stderr.on('data', (chunk) => { stderr += chunk })
+  const code = await new Promise((resolve) => {
+    const timer = setTimeout(() => { child.kill('SIGKILL'); resolve('timeout') }, 10_000)
+    child.on('exit', (exitCode) => { clearTimeout(timer); resolve(exitCode) })
+  })
+  server.close()
+  assert.equal(code, 1, `expected exit 1, got ${code}; stderr: ${stderr}`)
+  assert.match(stderr, /All relay subscriptions closed/)
 })

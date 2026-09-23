@@ -76,6 +76,31 @@ export function base64ToHex(b64) {
 
 const nowSec = () => Math.floor(Date.now() / 1000)
 
+/**
+ * Tracks which relays still carry a live request subscription and calls
+ * `onAllClosed` once, when the last one goes.
+ *
+ * nostr-tools does not reconnect a Relay by default, and a dropped connection
+ * closes its subscriptions. Without this the bridge would stay up, deaf to
+ * every request, for as long as the process lives. Exiting instead hands
+ * recovery to the supervisor (Docker's `restart: unless-stopped`, systemd),
+ * and a fresh start reconnects, re-subscribes and republishes the kind 13194
+ * info event. A subscription the relay itself closes (a CLOSED message) is
+ * just as deaf, so it counts the same as a dropped connection.
+ */
+export function watchRelayLiveness(urls, onAllClosed) {
+  const live = new Set(urls)
+  let fired = live.size === 0
+  return {
+    closed(url) {
+      if (!live.delete(url) || fired || live.size > 0) return
+      fired = true
+      onAllClosed()
+    },
+    get live() { return [...live] },
+  }
+}
+
 // Map an LND invoice object (AddInvoice lookup / ListInvoices element) onto a
 // NIP-47 transaction. `state` is set explicitly: a NIP-47 client keys
 // settlement off it (a missing state reads as unsettled even with a preimage),
@@ -372,16 +397,33 @@ async function main() {
     }
   }
 
+  let shuttingDown = false
+  const liveness = watchRelayLiveness(conns.map(({ url }) => url), () => {
+    if (shuttingDown) return
+    console.error('All relay subscriptions closed; exiting so the supervisor restarts the bridge')
+    process.exit(1)
+  })
+
   const filter = { kinds: [23194], authors: [clientPubkey], '#p': [bridgePubkey], since: nowSec() - 10 }
-  const subs = conns.map(({ relay }) => relay.subscribe([filter], { onevent: onRequest }))
+  const subs = conns.map(({ url, relay }) => relay.subscribe([filter], {
+    onevent: onRequest,
+    onclose: (reason) => {
+      if (shuttingDown) return
+      console.warn(`WARN: subscription on ${url} closed: ${reason || 'no reason given'}`)
+      liveness.closed(url)
+    },
+  }))
 
   console.log('Listening for NWC requests...\n')
-  process.on('SIGINT', () => {
+  const shutdown = () => {
+    shuttingDown = true
     console.log('\nShutting down...')
     for (const s of subs) { try { s.close() } catch { /* ignore */ } }
     for (const { relay } of conns) { try { relay.close() } catch { /* ignore */ } }
     process.exit(0)
-  })
+  }
+  process.on('SIGINT', shutdown)
+  process.on('SIGTERM', shutdown)
 }
 
 if (isMain) {

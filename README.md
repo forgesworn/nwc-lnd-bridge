@@ -101,6 +101,11 @@ These are the traps a NIP-47 bridge falls into. Each is handled and tested.
   it is derived from LND's invoice state.
 - **Hashes and preimages are converted base64 to hex.** LND REST returns them
   base64; NWC expects hex.
+- **Losing every relay stops the process.** The bridge does not reconnect. When
+  the last relay subscription closes it exits with status 1, so run it under a
+  supervisor that restarts it (the compose file uses `restart: unless-stopped`;
+  under systemd use `Restart=on-failure`). A restart reconnects, re-subscribes
+  and republishes the info event.
 - **`get_balance` reports only the spendable (local) side.** Inbound and pending
   are excluded, because a caller reads the balance as what it can spend.
 
