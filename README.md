@@ -5,11 +5,8 @@ It listens for kind 23194 requests on a relay, proxies them to LND's REST API,
 and publishes kind 23195 responses. On startup it writes a
 `nostr+walletconnect://` URI to an owner-only file.
 
-It is the LND analogue of
-[`nwc-phoenixd-bridge`](https://github.com/forgesworn/nwc-phoenixd-bridge): the
-same NWC, relay and NIP-44 plumbing, with LND as the backend instead of
-phoenixd. That turns any LND, including a mint's node, into a reusable NWC
-wallet for clients like [`@forgesworn/nwc-kit`](https://github.com/forgesworn/nwc-kit)
+It turns any LND, including a mint's node, into a reusable NWC wallet for
+clients like [`@forgesworn/nwc-kit`](https://github.com/forgesworn/nwc-kit)
 and the merchant backend in
 [`toll-booth`](https://github.com/forgesworn/toll-booth).
 

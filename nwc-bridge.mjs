@@ -3,9 +3,7 @@
  * Minimal NWC-to-LND bridge
  *
  * Listens for NIP-47 (kind 23194) wallet requests on a relay, proxies them to
- * an LND REST API, and publishes responses (kind 23195). It is the LND analogue
- * of nwc-phoenixd-bridge: same NWC/relay/NIP-44 plumbing, a different wallet
- * backend.
+ * an LND REST API, and publishes responses (kind 23195).
  *
  * The emitted `nostr+walletconnect://` URI is a capability over the node it
  * fronts. This bridge scopes that capability with a method allowlist that
