@@ -7,6 +7,11 @@
 - Exit with status 1 when every relay subscription has closed. The bridge
   previously stayed up after a relay drop, deaf to every request, because
   nostr-tools does not reconnect by default. SIGTERM now shuts down cleanly.
+- `pay_invoice` now needs `MAX_PAY_MSAT` and `FEE_LIMIT_MSAT`. The bridge asks
+  LND to decode each invoice and refuses one above the cap with
+  `QUOTA_EXCEEDED`, passes the fee ceiling to LND as `fee_limit`, and pays an
+  amountless invoice only for an explicit, capped NIP-47 `amount`. It also
+  reports `fees_paid`.
 
 ## 0.1.0
 

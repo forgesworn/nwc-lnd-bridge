@@ -36,11 +36,35 @@ keep it safe to point at a funds-holding node:
    Then the node itself rejects a spend even if the allowlist were widened by
    mistake. Belt and braces.
 
-To deliberately run a full wallet (own funds, not a mint), list the methods:
+To deliberately run a full wallet (own funds, not a mint), list the methods
+and set both spend limits. The bridge refuses to start with `pay_invoice`
+enabled unless both are set:
 
 ```sh
 NWC_METHODS="make_invoice lookup_invoice pay_invoice get_balance get_info"
+MAX_PAY_MSAT=100000    # largest single payment, in millisatoshis
+FEE_LIMIT_MSAT=2000    # most routing fee LND may spend on one payment
 ```
+
+### What the spend limits cover
+
+These are the only limits the bridge enforces. There is no daily or total
+budget, no rate limit and no per-destination rule. Anyone holding the URI can
+make as many payments as they like, each up to `MAX_PAY_MSAT` plus up to
+`FEE_LIMIT_MSAT` in fees, until the node runs out of funds. For a real budget,
+fund the node (or a dedicated LND account) with no more than you are willing to
+lose through the URI.
+
+- **`MAX_PAY_MSAT`** caps the amount of each payment. The bridge asks LND to
+  decode the invoice and refuses anything above the cap with `QUOTA_EXCEEDED`
+  before paying. For an amountless invoice the NIP-47 `amount` is used, capped
+  the same way, and passed to LND as `amt_msat`; an amountless invoice with no
+  `amount` is refused. An `amount` that contradicts the invoice is refused.
+- **`FEE_LIMIT_MSAT`** is passed to LND on every payment as
+  `fee_limit.fixed_msat`, so a route costing more than that is not taken.
+
+With `pay_invoice` enabled the macaroon needs `offchain:read` (to decode the
+invoice) and `offchain:write` (to pay it).
 
 ## Run
 
@@ -75,6 +99,8 @@ the same URI across restarts.
 | `LND_TLS_INSECURE` | unset | `1` skips TLS verification for a non-loopback LND without a cert. The macaroon crosses that link in every request, so only on a network you trust |
 | `RELAY` | `wss://relay.damus.io` | Relay(s) to serve NWC on. One URL, or several separated by spaces or commas, for resilience |
 | `NWC_METHODS` | invoice-only set | Space-separated method allowlist |
+| `MAX_PAY_MSAT` | none | Per-payment cap in msat. Required when `pay_invoice` is enabled |
+| `FEE_LIMIT_MSAT` | none | Routing fee ceiling per payment in msat. Required when `pay_invoice` is enabled |
 | `BRIDGE_SECRET` / `CLIENT_SECRET` | random | Hex 32-byte keys; set to persist the URI |
 
 ## Method map
@@ -86,7 +112,7 @@ the same URI across restarts.
 | `list_transactions` | `GET /v1/invoices?reversed=true` |
 | `get_info` | `GET /v1/getinfo` |
 | `get_balance` (opt-in) | `GET /v1/balance/channels` (local/spendable) |
-| `pay_invoice` (opt-in) | `POST /v1/channels/transactions` |
+| `pay_invoice` (opt-in) | `GET /v1/payreq/{invoice}`, then `POST /v1/channels/transactions` (`fee_limit`, `amt_msat` for amountless) |
 
 ## Correctness notes
 

@@ -137,13 +137,31 @@ function normalizePaymentHash(params) {
 }
 
 /**
+ * Parse an optional milli-satoshi setting. Returns undefined when unset and
+ * throws on anything that is not a non-negative safe integer, so a typo can
+ * never silently lift a spend limit.
+ */
+export function parseMsat(value, name) {
+  if (value === undefined || value === '') return undefined
+  const text = String(value).trim()
+  const parsed = Number(text)
+  if (!/^\d+$/.test(text) || !Number.isSafeInteger(parsed)) {
+    throw new Error(`${name} must be a whole number of millisatoshis`)
+  }
+  return parsed
+}
+
+/**
  * Build the NWC method dispatcher.
  *
  * @param lnd  async (httpMethod, path, body?) => parsed JSON. Injected so the
  *             handler is testable without a real node.
  * @param allowedMethods  iterable of permitted NIP-47 methods.
+ * @param maxPayMsat  per-payment cap for pay_invoice, invoice amount only.
+ * @param feeLimitMsat  routing fee ceiling passed to LND on every payment.
+ *             pay_invoice refuses to run unless both are set.
  */
-export function createHandler({ lnd, allowedMethods }) {
+export function createHandler({ lnd, allowedMethods, maxPayMsat, feeLimitMsat }) {
   const allow = allowedMethods instanceof Set ? allowedMethods : new Set(allowedMethods)
 
   return async function handle(method, params = {}) {
@@ -210,7 +228,46 @@ export function createHandler({ lnd, allowedMethods }) {
       }
 
       case 'pay_invoice': {
-        const res = await lnd('POST', '/v1/channels/transactions', { payment_request: params.invoice })
+        // Fail closed: a spending bridge with no configured limits pays nothing.
+        if (!Number.isSafeInteger(maxPayMsat) || maxPayMsat <= 0 ||
+            !Number.isSafeInteger(feeLimitMsat) || feeLimitMsat < 0) {
+          throw nwcError('RESTRICTED', 'pay_invoice is not configured with spend limits')
+        }
+        const invoice = params.invoice
+        if (typeof invoice !== 'string' || invoice.length === 0 || invoice.length > 20_000) {
+          throw nwcError('OTHER', 'pay_invoice requires an invoice')
+        }
+        const requested = params.amount
+        if (requested !== undefined && (!Number.isSafeInteger(requested) || requested <= 0)) {
+          throw nwcError('OTHER', 'amount must be a positive whole number of millisatoshis')
+        }
+        // Ask the node what the invoice is for, rather than trusting the
+        // caller, so the cap applies to what would actually be paid.
+        const decoded = await lnd('GET', `/v1/payreq/${encodeURIComponent(invoice)}`)
+        const invoiceMsat = decoded.num_msat && decoded.num_msat !== '0'
+          ? Number(decoded.num_msat)
+          : Number(decoded.num_satoshis || 0) * 1000
+        let amountMsat
+        if (invoiceMsat > 0) {
+          if (requested !== undefined && requested !== invoiceMsat) {
+            throw nwcError('OTHER', 'amount does not match the invoice amount')
+          }
+          amountMsat = invoiceMsat
+        } else {
+          if (requested === undefined) {
+            throw nwcError('OTHER', 'an amountless invoice needs an amount')
+          }
+          amountMsat = requested
+        }
+        if (amountMsat > maxPayMsat) {
+          throw nwcError('QUOTA_EXCEEDED', `payment of ${amountMsat} msat exceeds this bridge's per-payment limit of ${maxPayMsat} msat`)
+        }
+        const body = {
+          payment_request: invoice,
+          fee_limit: { fixed_msat: String(feeLimitMsat) },
+          ...(invoiceMsat > 0 ? {} : { amt_msat: String(amountMsat) }),
+        }
+        const res = await lnd('POST', '/v1/channels/transactions', body)
         // LND reports a routing failure as payment_error with no preimage. The
         // preimage is the only proof of settlement, so its absence is never a
         // success: a definite failure throws PAYMENT_FAILED, a silent absence is
@@ -222,7 +279,8 @@ export function createHandler({ lnd, allowedMethods }) {
         if (!preimage) {
           throw nwcError('OTHER', 'payment returned no preimage, outcome unknown, reconcile before retrying')
         }
-        return { preimage }
+        const fees = res.payment_route && res.payment_route.total_fees_msat
+        return { preimage, ...(fees !== undefined ? { fees_paid: Number(fees) } : {}) }
       }
 
       default:
@@ -287,7 +345,20 @@ async function main() {
     return text ? JSON.parse(text) : {}
   }
 
-  const handle = createHandler({ lnd, allowedMethods })
+  let maxPayMsat, feeLimitMsat
+  try {
+    maxPayMsat = parseMsat(process.env.MAX_PAY_MSAT, 'MAX_PAY_MSAT')
+    feeLimitMsat = parseMsat(process.env.FEE_LIMIT_MSAT, 'FEE_LIMIT_MSAT')
+  } catch (err) {
+    console.error(err.message)
+    process.exit(1)
+  }
+  if (allowedMethods.has('pay_invoice') && (!maxPayMsat || feeLimitMsat === undefined)) {
+    console.error('pay_invoice is enabled: set MAX_PAY_MSAT (per-payment cap) and FEE_LIMIT_MSAT (routing fee ceiling)')
+    process.exit(1)
+  }
+
+  const handle = createHandler({ lnd, allowedMethods, maxPayMsat, feeLimitMsat })
 
   const bridgeSecret = process.env.BRIDGE_SECRET ? hexToBytes(process.env.BRIDGE_SECRET) : generateSecretKey()
   const bridgePubkey = getPublicKey(bridgeSecret)
@@ -301,6 +372,7 @@ async function main() {
   console.log(nwcUri)
   console.log(`\nMethods: ${[...allowedMethods].join(' ')}`)
   console.log(`Capability: ${spends ? 'CAN SPEND (pay_invoice enabled)' : 'invoice-only (cannot spend)'}`)
+  if (spends) console.log(`Spend limits: ${maxPayMsat} msat per payment, ${feeLimitMsat} msat fee ceiling`)
   console.log(`Bridge pubkey: ${bridgePubkey}`)
   console.log(`Client pubkey: ${clientPubkey}`)
   console.log(`Relays: ${relays.join(', ')}`)

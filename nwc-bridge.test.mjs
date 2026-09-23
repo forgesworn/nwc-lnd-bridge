@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
-import { createHandler, mapInvoice, base64ToHex, parseRelays, allowUnverifiedTls, watchRelayLiveness, DEFAULT_METHODS } from './nwc-bridge.mjs'
+import { createHandler, mapInvoice, base64ToHex, parseRelays, allowUnverifiedTls, watchRelayLiveness, parseMsat, DEFAULT_METHODS } from './nwc-bridge.mjs'
 
 const b64 = (byte) => Buffer.alloc(32, byte).toString('base64')
 const hex = (byte) => byte.toString(16).padStart(2, '0').repeat(32)
@@ -170,27 +170,87 @@ test('default allowlist is invoice-only: pay_invoice and get_balance are RESTRIC
   await assert.rejects(handle('get_balance', {}), expectCode('RESTRICTED'))
 })
 
-test('pay_invoice, when enabled, requires a preimage and honours payment_error', async () => {
-  const allow = [...DEFAULT_METHODS, 'pay_invoice']
+const PAY = [...DEFAULT_METHODS, 'pay_invoice']
+const LIMITS = { maxPayMsat: 50_000, feeLimitMsat: 1_000 }
+const decodes = (numMsat) => ({ 'GET /v1/payreq/lnbc1': { num_msat: String(numMsat), num_satoshis: String(Math.floor(numMsat / 1000)) } })
 
+test('pay_invoice, when enabled, requires a preimage and honours payment_error', async () => {
   const ok = createHandler({
-    lnd: fakeLnd({ 'POST /v1/channels/transactions': { payment_error: '', payment_preimage: b64(0xee) } }).lnd,
-    allowedMethods: allow,
+    lnd: fakeLnd({ ...decodes(10_000), 'POST /v1/channels/transactions': { payment_error: '', payment_preimage: b64(0xee) } }).lnd,
+    allowedMethods: PAY, ...LIMITS,
   })
   assert.deepEqual(await ok('pay_invoice', { invoice: 'lnbc1' }), { preimage: hex(0xee) })
 
   const routingFail = createHandler({
-    lnd: fakeLnd({ 'POST /v1/channels/transactions': { payment_error: 'no_route', payment_preimage: '' } }).lnd,
-    allowedMethods: allow,
+    lnd: fakeLnd({ ...decodes(10_000), 'POST /v1/channels/transactions': { payment_error: 'no_route', payment_preimage: '' } }).lnd,
+    allowedMethods: PAY, ...LIMITS,
   })
   await assert.rejects(routingFail('pay_invoice', { invoice: 'lnbc1' }), expectCode('PAYMENT_FAILED'))
 
   // No error AND no preimage: an unknown outcome, never reported as success.
   const silent = createHandler({
-    lnd: fakeLnd({ 'POST /v1/channels/transactions': { payment_error: '', payment_preimage: '' } }).lnd,
-    allowedMethods: allow,
+    lnd: fakeLnd({ ...decodes(10_000), 'POST /v1/channels/transactions': { payment_error: '', payment_preimage: '' } }).lnd,
+    allowedMethods: PAY, ...LIMITS,
   })
   await assert.rejects(silent('pay_invoice', { invoice: 'lnbc1' }), expectCode('OTHER'))
+})
+
+test('pay_invoice refuses to pay at all without configured limits', async () => {
+  let touched = false
+  const lnd = async () => { touched = true; return {} }
+  for (const limits of [{}, { maxPayMsat: 50_000 }, { feeLimitMsat: 1_000 }, { maxPayMsat: 0, feeLimitMsat: 0 }]) {
+    const handle = createHandler({ lnd, allowedMethods: PAY, ...limits })
+    await assert.rejects(handle('pay_invoice', { invoice: 'lnbc1' }), expectCode('RESTRICTED'))
+  }
+  assert.equal(touched, false)
+})
+
+test('pay_invoice refuses an invoice above MAX_PAY_MSAT with QUOTA_EXCEEDED, before paying', async () => {
+  const { lnd, calls } = fakeLnd({ ...decodes(50_001) })
+  const handle = createHandler({ lnd, allowedMethods: PAY, ...LIMITS })
+  await assert.rejects(handle('pay_invoice', { invoice: 'lnbc1' }), expectCode('QUOTA_EXCEEDED'))
+  assert.deepEqual(calls.map((c) => c.path), ['/v1/payreq/lnbc1'])
+})
+
+test('pay_invoice passes FEE_LIMIT_MSAT to LND as fee_limit.fixed_msat', async () => {
+  const { lnd, calls } = fakeLnd({
+    ...decodes(50_000),
+    'POST /v1/channels/transactions': { payment_preimage: b64(0xee), payment_route: { total_fees_msat: '12' } },
+  })
+  const handle = createHandler({ lnd, allowedMethods: PAY, ...LIMITS })
+  assert.deepEqual(await handle('pay_invoice', { invoice: 'lnbc1' }), { preimage: hex(0xee), fees_paid: 12 })
+  const pay = calls.find((c) => c.method === 'POST')
+  assert.deepEqual(pay.body, { payment_request: 'lnbc1', fee_limit: { fixed_msat: '1000' } })
+})
+
+test('pay_invoice pays an amountless invoice for the NIP-47 amount, capped, as amt_msat', async () => {
+  const route = { ...decodes(0), 'POST /v1/channels/transactions': { payment_preimage: b64(0xee) } }
+  const { lnd, calls } = fakeLnd(route)
+  const handle = createHandler({ lnd, allowedMethods: PAY, ...LIMITS })
+  await handle('pay_invoice', { invoice: 'lnbc1', amount: 21_000 })
+  assert.equal(calls.find((c) => c.method === 'POST').body.amt_msat, '21000')
+
+  await assert.rejects(handle('pay_invoice', { invoice: 'lnbc1' }), expectCode('OTHER'))
+  await assert.rejects(handle('pay_invoice', { invoice: 'lnbc1', amount: 50_001 }), expectCode('QUOTA_EXCEEDED'))
+  await assert.rejects(handle('pay_invoice', { invoice: 'lnbc1', amount: -1 }), expectCode('OTHER'))
+  assert.equal(calls.filter((c) => c.method === 'POST').length, 1)
+})
+
+test('pay_invoice refuses an amount that contradicts the invoice', async () => {
+  const { lnd, calls } = fakeLnd(decodes(10_000))
+  const handle = createHandler({ lnd, allowedMethods: PAY, ...LIMITS })
+  await assert.rejects(handle('pay_invoice', { invoice: 'lnbc1', amount: 1 }), expectCode('OTHER'))
+  assert.equal(calls.some((c) => c.method === 'POST'), false)
+})
+
+test('parseMsat accepts whole msat values and refuses anything else', () => {
+  assert.equal(parseMsat(undefined, 'X'), undefined)
+  assert.equal(parseMsat('', 'X'), undefined)
+  assert.equal(parseMsat('0', 'X'), 0)
+  assert.equal(parseMsat(' 21000 ', 'X'), 21000)
+  for (const bad of ['-1', '1.5', '1e3', 'abc', '99999999999999999999']) {
+    assert.throws(() => parseMsat(bad, 'X'), /X must be/)
+  }
 })
 
 test('get_info reports exactly the allowlist as its methods', async () => {

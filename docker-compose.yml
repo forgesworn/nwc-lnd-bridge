@@ -22,6 +22,8 @@ services:
       - LND_TLS_INSECURE=${LND_TLS_INSECURE:-}
       - RELAY=${NWC_RELAY:-wss://relay.damus.io}
       - NWC_METHODS=${NWC_METHODS:-}           # blank = invoice-only default
+      - MAX_PAY_MSAT=${MAX_PAY_MSAT:-}         # required with pay_invoice
+      - FEE_LIMIT_MSAT=${FEE_LIMIT_MSAT:-}     # required with pay_invoice
       - BRIDGE_SECRET=${BRIDGE_SECRET:-}
       - CLIENT_SECRET=${CLIENT_SECRET:-}
 #    networks:
