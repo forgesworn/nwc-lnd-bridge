@@ -19,8 +19,7 @@ file path and a short fingerprint of the wallet pubkey. Two independent guards
 keep it safe to point at a funds-holding node:
 
 1. **Method allowlist, invoice-only by default.** With `NWC_METHODS` unset the
-   bridge serves only `make_invoice`, `lookup_invoice`, `list_transactions` and
-   `get_info`. It advertises exactly that set in its kind 13194 info event and
+   bridge serves only `make_invoice`, `lookup_invoice` and `get_info`. It advertises exactly that set in its kind 13194 info event and
    refuses anything else before the request reaches LND, so the URI **cannot
    spend or disclose a balance**. `pay_invoice` and `get_balance` are opt-in.
 2. **An invoice-only macaroon.** Independently of the allowlist, authenticate
@@ -106,7 +105,7 @@ from the environment.
 | `LND_CERT_PATH` / `LND_CERT` | none | LND `tls.cert` (path, or inline PEM / base64). Required unless LND is on loopback |
 | `LND_TLS_INSECURE` | unset | `1` skips TLS verification for a non-loopback LND without a cert. The macaroon crosses that link in every request, so only on a network you trust |
 | `RELAY` | `wss://relay.damus.io` | Relay(s) to serve NWC on. One URL, or several separated by spaces or commas, for resilience |
-| `NWC_METHODS` | invoice-only set | Space-separated method allowlist |
+| `NWC_METHODS` | invoice-only set | Space-separated method allowlist from `make_invoice lookup_invoice get_info get_balance pay_invoice` |
 | `MAX_PAY_MSAT` | none | Per-payment cap in msat. Required when `pay_invoice` is enabled |
 | `FEE_LIMIT_MSAT` | none | Routing fee ceiling per payment in msat. Required when `pay_invoice` is enabled |
 | `DATA_DIR` | `./data` (`/data` in Docker) | Where `keys.json` and `nwc-uri.txt` are written, both mode 0600 |
@@ -118,7 +117,6 @@ from the environment.
 | --- | --- |
 | `make_invoice` | `POST /v1/invoices` (`value_msat`, `description_hash`) |
 | `lookup_invoice` | `GET /v1/invoice/{payment_hash}` |
-| `list_transactions` | `GET /v1/invoices?reversed=true` |
 | `get_info` | `GET /v1/getinfo` |
 | `get_balance` (opt-in) | `GET /v1/balance/channels` (local/spendable) |
 | `pay_invoice` (opt-in) | `GET /v1/payreq/{invoice}`, then `POST /v1/channels/transactions` (`fee_limit`, `amt_msat` for amountless) |
@@ -148,8 +146,13 @@ These are the traps a NIP-47 bridge falls into. Each is handled and tested.
   are excluded, because a caller reads the balance as what it can spend.
 
 Built to satisfy a strict NIP-44-only client: the kind 13194 info event always
-carries `["encryption", "nip44_v2"]`, and `list_transactions` is advertised as
-extension `05`.
+carries `["encryption", "nip44_v2"]` and lists exactly the allowlist.
+
+`list_transactions` (extension `05`) is not supported. Answering it honestly
+means honouring `type`, `from`, `until`, `offset` and `unpaid` and merging
+outgoing payments with incoming invoices; a partial version would mislead any
+client that trusts the advertisement. `NWC_METHODS` refuses to start with a
+method the bridge does not implement.
 
 ## Tests
 

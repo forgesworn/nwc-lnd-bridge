@@ -7,8 +7,7 @@
  *
  * The emitted `nostr+walletconnect://` URI is a capability over the node it
  * fronts. This bridge scopes that capability with a method allowlist that
- * DEFAULTS TO INVOICE-ONLY: `make_invoice lookup_invoice list_transactions
- * get_info`. `pay_invoice` and `get_balance` are opt-in via NWC_METHODS, so a
+ * DEFAULTS TO INVOICE-ONLY: `make_invoice lookup_invoice get_info`. `pay_invoice` and `get_balance` are opt-in via NWC_METHODS, so a
  * URI pointed at a funds-holding node cannot spend or disclose its balance
  * unless you deliberately allow it. Prefer an invoice-baked macaroon as a
  * second, independent guard.
@@ -33,7 +32,27 @@ import { readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync, existsSy
 import { join } from 'node:path'
 
 // Invoice-only. No pay_invoice (spend), no get_balance (disclosure).
-export const DEFAULT_METHODS = ['make_invoice', 'lookup_invoice', 'list_transactions', 'get_info']
+export const DEFAULT_METHODS = ['make_invoice', 'lookup_invoice', 'get_info']
+
+// Everything this bridge implements. list_transactions (extension 05) is not
+// here: answering it honestly means filtering by type, time and paid state and
+// merging outgoing payments with incoming invoices, and serving part of that
+// would mislead a client that trusts the advertisement.
+export const SUPPORTED_METHODS = ['make_invoice', 'lookup_invoice', 'get_info', 'get_balance', 'pay_invoice']
+
+/**
+ * Parse NWC_METHODS. Blank means the invoice-only default. An unsupported name
+ * is an error rather than something to advertise and then fail on.
+ */
+export function parseMethods(input) {
+  const methods = String(input || '').split(/[\s,]+/).filter(Boolean)
+  if (methods.length === 0) return new Set(DEFAULT_METHODS)
+  const unsupported = methods.filter((method) => !SUPPORTED_METHODS.includes(method))
+  if (unsupported.length > 0) {
+    throw new Error(`NWC_METHODS lists unsupported methods: ${unsupported.join(' ')} (supported: ${SUPPORTED_METHODS.join(' ')})`)
+  }
+  return new Set(methods)
+}
 
 // RELAY may be a single URL or a whitespace/comma-separated list. Serving the
 // connection on several relays makes it resilient: a request delivered on any
@@ -297,13 +316,6 @@ export function createHandler({ lnd, allowedMethods, maxPayMsat, feeLimitMsat })
         return mapInvoice(inv)
       }
 
-      case 'list_transactions': {
-        const limit = Number(params.limit || 10)
-        const query = new URLSearchParams({ num_max_invoices: String(limit), reversed: 'true' })
-        const res = await lnd('GET', `/v1/invoices?${query.toString()}`)
-        return { transactions: (res.invoices || []).map(mapInvoice) }
-      }
-
       case 'pay_invoice': {
         // Fail closed: a spending bridge with no configured limits pays nothing.
         if (!Number.isSafeInteger(maxPayMsat) || maxPayMsat <= 0 ||
@@ -385,8 +397,13 @@ async function main() {
     console.error('RELAY must contain at least one ws:// or wss:// URL')
     process.exit(1)
   }
-  const methods = (process.env.NWC_METHODS || DEFAULT_METHODS.join(' ')).split(/\s+/).filter(Boolean)
-  const allowedMethods = new Set(methods)
+  let allowedMethods
+  try {
+    allowedMethods = parseMethods(process.env.NWC_METHODS)
+  } catch (err) {
+    console.error(err.message)
+    process.exit(1)
+  }
 
   if (!LND_MACAROON || !/^[0-9a-f]+$/i.test(LND_MACAROON)) {
     console.error('LND_MACAROON is required and must be hex (bake an invoice-only macaroon for a funds node)')
@@ -514,7 +531,6 @@ async function main() {
   // NIP-44-only client refuses a wallet that advertises no encryption tag, so
   // this is required for discovery, not optional. Advertise exactly the allowlist.
   const infoTags = [['encryption', 'nip44_v2']]
-  if (allowedMethods.has('list_transactions')) infoTags.push(['extensions', '05'])
   const infoEvent = finalizeEvent({
     kind: 13194,
     created_at: nowSec(),

@@ -25,6 +25,11 @@
 - `.env.example` no longer sets `LND_REST_URL` to `127.0.0.1`, which inside
   the container is the container itself and overrode the compose default. Both
   now use `host.docker.internal`, which compose maps on Linux as well.
+- Stop advertising `list_transactions` and extension `05`. The handler ignored
+  `type`, `from`, `until`, `offset` and `unpaid` and did not cap `limit`, so it
+  answered a different question from the one asked. It is removed from the
+  default allowlist, and `NWC_METHODS` now refuses any method the bridge does
+  not implement instead of advertising it.
 - The Docker image installs from the lockfile with `npm ci --omit=dev` and runs
   as the unprivileged `node` user, which owns the `/data` directory.
 

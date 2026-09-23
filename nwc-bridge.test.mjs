@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process'
 import { mkdtempSync, readFileSync, statSync, writeFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createHandler, mapInvoice, base64ToHex, parseRelays, allowUnverifiedTls, watchRelayLiveness, parseMsat, isExpired, loadOrCreateKeys, writePrivateFile, fingerprint, DEFAULT_METHODS } from './nwc-bridge.mjs'
+import { createHandler, mapInvoice, base64ToHex, parseRelays, allowUnverifiedTls, watchRelayLiveness, parseMsat, isExpired, parseMethods, SUPPORTED_METHODS, loadOrCreateKeys, writePrivateFile, fingerprint, DEFAULT_METHODS } from './nwc-bridge.mjs'
 
 const b64 = (byte) => Buffer.alloc(32, byte).toString('base64')
 const hex = (byte) => byte.toString(16).padStart(2, '0').repeat(32)
@@ -474,4 +474,22 @@ test('the running bridge ignores an expired request and serves a live one', asyn
   }
   assert.match(output, /dropped an expired request/)
   assert.doesNotMatch(output, /NWC request: make_invoice/)
+})
+
+test('list_transactions is neither a default nor accepted, so it is never advertised', async () => {
+  assert.equal(DEFAULT_METHODS.includes('list_transactions'), false)
+  assert.equal(SUPPORTED_METHODS.includes('list_transactions'), false)
+  assert.throws(() => parseMethods('make_invoice list_transactions'), /unsupported methods: list_transactions/)
+  // Even if a caller forces it into the allowlist, nothing reaches LND.
+  let touched = false
+  const handle = createHandler({ lnd: async () => { touched = true; return {} }, allowedMethods: ['list_transactions'] })
+  await assert.rejects(handle('list_transactions', { limit: 1000 }), expectCode('NOT_IMPLEMENTED'))
+  assert.equal(touched, false)
+})
+
+test('parseMethods defaults to invoice-only and accepts supported opt-ins', () => {
+  assert.deepEqual([...parseMethods('')], DEFAULT_METHODS)
+  assert.deepEqual([...parseMethods(undefined)], DEFAULT_METHODS)
+  assert.deepEqual([...parseMethods('make_invoice pay_invoice,get_info')], ['make_invoice', 'pay_invoice', 'get_info'])
+  assert.throws(() => parseMethods('sign_message'), /unsupported/)
 })
