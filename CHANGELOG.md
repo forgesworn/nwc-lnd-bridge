@@ -22,6 +22,9 @@
   commits to it. It was silently dropped.
 - Drop requests whose NIP-40 `expiration` tag has passed, so a request delayed
   on a relay or replayed later cannot pay or mint after the client gave up.
+- `.env.example` no longer sets `LND_REST_URL` to `127.0.0.1`, which inside
+  the container is the container itself and overrode the compose default. Both
+  now use `host.docker.internal`, which compose maps on Linux as well.
 - The Docker image installs from the lockfile with `npm ci --omit=dev` and runs
   as the unprivileged `node` user, which owns the `/data` directory.
 

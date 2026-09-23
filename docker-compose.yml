@@ -15,6 +15,8 @@ services:
       dockerfile: Dockerfile.nwc
     container_name: nwc-lnd-bridge
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # Docker Desktop has it; Linux needs this
     environment:
       - LND_REST_URL=${LND_REST_URL:-https://host.docker.internal:8080}
       - LND_MACAROON=${LND_MACAROON}          # hex; invoice-only for a funds node
