@@ -52,6 +52,16 @@ export function parseRelays(input) {
 }
 
 // NIP-47 error codes used below. Anything unexpected collapses to OTHER.
+// Unverified TLS to LND is only tolerable when nothing sits on the path: the
+// macaroon travels in every request header. Loopback qualifies; anything else,
+// including a docker network, needs LND_TLS_INSECURE=1 to say so deliberately.
+export function allowUnverifiedTls(lndUrl, insecureFlag) {
+  if (insecureFlag === '1') return true
+  let host
+  try { host = new URL(lndUrl).hostname } catch { return false }
+  return host === 'localhost' || host === '[::1]' || /^127\.\d+\.\d+\.\d+$/.test(host)
+}
+
 export function nwcError(code, message) {
   const error = new Error(message)
   error.code = code
@@ -223,14 +233,18 @@ async function main() {
     process.exit(1)
   }
 
-  // TLS: LND serves a self-signed cert. Verify against it when given, otherwise
-  // fall back to no verification with a loud warning (only acceptable on a
-  // trusted localhost/docker network).
+  // TLS: LND serves a self-signed cert. Verify against it when given. Without
+  // one, refuse to start unless LND is on loopback or LND_TLS_INSECURE=1.
   let caPem
   if (process.env.LND_CERT_PATH) caPem = readFileSync(process.env.LND_CERT_PATH, 'utf8')
   else if (process.env.LND_CERT) caPem = process.env.LND_CERT.includes('BEGIN CERTIFICATE')
     ? process.env.LND_CERT
     : Buffer.from(process.env.LND_CERT, 'base64').toString('utf8')
+
+  if (!caPem && !allowUnverifiedTls(LND_REST_URL, process.env.LND_TLS_INSECURE)) {
+    console.error('LND_CERT(_PATH) is required when LND is not on loopback; set LND_TLS_INSECURE=1 to skip verification on a trusted network')
+    process.exit(1)
+  }
 
   const { Agent } = await import('undici')
   const dispatcher = new Agent({ connect: caPem ? { ca: caPem } : { rejectUnauthorized: false } })

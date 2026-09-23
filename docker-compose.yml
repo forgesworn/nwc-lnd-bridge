@@ -18,7 +18,8 @@ services:
     environment:
       - LND_REST_URL=${LND_REST_URL:-https://host.docker.internal:8080}
       - LND_MACAROON=${LND_MACAROON}          # hex; invoice-only for a funds node
-      - LND_CERT=${LND_CERT:-}                 # base64 or PEM of tls.cert (recommended)
+      - LND_CERT=${LND_CERT:-}                 # base64 or PEM of tls.cert (required unless LND_TLS_INSECURE=1)
+      - LND_TLS_INSECURE=${LND_TLS_INSECURE:-}
       - RELAY=${NWC_RELAY:-wss://relay.damus.io}
       - NWC_METHODS=${NWC_METHODS:-}           # blank = invoice-only default
       - BRIDGE_SECRET=${BRIDGE_SECRET:-}
