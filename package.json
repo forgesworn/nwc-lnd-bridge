@@ -6,9 +6,35 @@
   "bin": {
     "nwc-lnd-bridge": "nwc-bridge.mjs"
   },
+  "files": [
+    "nwc-bridge.mjs",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
   "scripts": {
     "start": "node nwc-bridge.mjs",
     "test": "node --test"
+  },
+  "keywords": [
+    "nostr",
+    "nwc",
+    "nip47",
+    "nostr-wallet-connect",
+    "lightning",
+    "lnd",
+    "bitcoin"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/forgesworn/nwc-lnd-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/forgesworn/nwc-lnd-bridge/issues"
+  },
+  "homepage": "https://github.com/forgesworn/nwc-lnd-bridge#readme",
+  "publishConfig": {
+    "provenance": true
   },
   "license": "MIT",
   "dependencies": {
