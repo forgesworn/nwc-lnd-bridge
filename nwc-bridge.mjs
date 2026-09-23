@@ -127,6 +127,18 @@ export function loadOrCreateKeys({ dataDir, env = {}, generate }) {
   return { bridgeSecret: keys.bridge_secret, clientSecret: keys.client_secret, source: 'new', path }
 }
 
+/**
+ * NIP-40: a request whose `expiration` tag is in the past must not be acted
+ * on. NWC clients set it so that a request delayed on a relay, or replayed
+ * later, cannot pay or mint after the client has stopped waiting for it.
+ */
+export function isExpired(event, now = nowSec()) {
+  const tag = event.tags.find((t) => t[0] === 'expiration')
+  if (!tag) return false
+  const expiresAt = Number(tag[1])
+  return !Number.isFinite(expiresAt) || expiresAt <= now
+}
+
 /** A short, loggable identifier for a public key. */
 export function fingerprint(pubkey) {
   return `${pubkey.slice(0, 8)}…${pubkey.slice(-8)}`
@@ -523,6 +535,10 @@ async function main() {
     // re-check make the client secret a real credential; without them a
     // pay-enabled URI would honour anyone.
     if (event.pubkey !== clientPubkey) return
+    if (isExpired(event)) {
+      console.warn('  -> dropped an expired request (NIP-40)')
+      return
+    }
     if (seen.has(event.id)) return
     seen.add(event.id)
     if (seen.size > 5000) seen.clear()

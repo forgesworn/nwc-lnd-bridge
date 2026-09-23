@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process'
 import { mkdtempSync, readFileSync, statSync, writeFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createHandler, mapInvoice, base64ToHex, parseRelays, allowUnverifiedTls, watchRelayLiveness, parseMsat, loadOrCreateKeys, writePrivateFile, fingerprint, DEFAULT_METHODS } from './nwc-bridge.mjs'
+import { createHandler, mapInvoice, base64ToHex, parseRelays, allowUnverifiedTls, watchRelayLiveness, parseMsat, isExpired, loadOrCreateKeys, writePrivateFile, fingerprint, DEFAULT_METHODS } from './nwc-bridge.mjs'
 
 const b64 = (byte) => Buffer.alloc(32, byte).toString('base64')
 const hex = (byte) => byte.toString(16).padStart(2, '0').repeat(32)
@@ -418,4 +418,60 @@ test('the running bridge writes the URI to an owner-only file and never logs a s
   assert.ok(!output.includes(keys.client_secret), 'the client secret must not be logged')
   assert.ok(!output.includes(keys.bridge_secret), 'the bridge secret must not be logged')
   assert.ok(!output.includes('nostr+walletconnect://'), 'the URI must not be logged')
+})
+
+test('isExpired follows NIP-40', () => {
+  const at = (value) => ({ tags: [['p', 'x'], ['expiration', value]] })
+  assert.equal(isExpired({ tags: [] }, 1000), false)
+  assert.equal(isExpired(at('1001'), 1000), false)
+  assert.equal(isExpired(at('1000'), 1000), true)
+  assert.equal(isExpired(at('999'), 1000), true)
+  assert.equal(isExpired(at('soon'), 1000), true) // unreadable expiry fails closed
+})
+
+test('the running bridge ignores an expired request and serves a live one', async () => {
+  const { finalizeEvent, getPublicKey } = await import('nostr-tools/pure')
+  const { getConversationKey, encrypt } = await import('nostr-tools/nip44')
+  const bridgeSecret = hex(0x11)
+  const clientSecret = Uint8Array.from(Buffer.from(hex(0x22), 'hex'))
+  const bridgePubkey = getPublicKey(Uint8Array.from(Buffer.from(bridgeSecret, 'hex')))
+  const key = getConversationKey(clientSecret, bridgePubkey)
+  const now = Math.floor(Date.now() / 1000)
+  const request = (method, expiration) => finalizeEvent({
+    kind: 23194,
+    created_at: now,
+    tags: [['p', bridgePubkey], ['expiration', String(expiration)]],
+    content: encrypt(JSON.stringify({ method, params: {} }), key),
+  }, clientSecret)
+
+  const server = await startTestRelay((message, relay) => {
+    if (message[0] === 'EVENT') relay.send(['OK', message[1].id, true, ''])
+    if (message[0] === 'REQ') {
+      relay.send(['EVENT', message[1], request('make_invoice', now - 5)])
+      relay.send(['EVENT', message[1], request('lookup_invoice', now + 60)])
+    }
+  })
+  const env = bridgeTestEnv({ RELAY: server.url, BRIDGE_SECRET: bridgeSecret, CLIENT_SECRET: hex(0x22) })
+  const child = spawn(process.execPath, ['nwc-bridge.mjs'], {
+    cwd: new URL('.', import.meta.url), env, stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  let output = ''
+  const done = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`no request handled: ${output}`)), 10_000)
+    const onData = (chunk) => {
+      output += chunk
+      if (output.includes('NWC request: lookup_invoice')) { clearTimeout(timer); resolve() }
+    }
+    child.stdout.on('data', onData)
+    child.stderr.on('data', onData)
+  })
+  try {
+    await done
+  } finally {
+    child.kill('SIGTERM')
+    await new Promise((resolve) => child.on('exit', resolve))
+    server.close()
+  }
+  assert.match(output, /dropped an expired request/)
+  assert.doesNotMatch(output, /NWC request: make_invoice/)
 })

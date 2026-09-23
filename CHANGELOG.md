@@ -20,6 +20,8 @@
   deprecated; the README shows how to move them into `keys.json`.
 - `make_invoice` honours `description_hash`, passing it to LND so the invoice
   commits to it. It was silently dropped.
+- Drop requests whose NIP-40 `expiration` tag has passed, so a request delayed
+  on a relay or replayed later cannot pay or mint after the client gave up.
 - The Docker image installs from the lockfile with `npm ci --omit=dev` and runs
   as the unprivileged `node` user, which owns the `/data` directory.
 

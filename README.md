@@ -139,6 +139,9 @@ These are the traps a NIP-47 bridge falls into. Each is handled and tested.
   it is derived from LND's invoice state.
 - **Hashes and preimages are converted base64 to hex.** LND REST returns them
   base64; NWC expects hex.
+- **Expired requests are ignored.** A request whose NIP-40 `expiration` has
+  passed is dropped unanswered, so a delayed or replayed request cannot pay or
+  mint after the client stopped waiting.
 - **Losing every relay stops the process.** The bridge does not reconnect. When
   the last relay subscription closes it exits with status 1, so run it under a
   supervisor that restarts it (the compose file uses `restart: unless-stopped`;
