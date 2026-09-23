@@ -18,6 +18,8 @@
   and only the file path and a wallet pubkey fingerprint are logged.
   `BRIDGE_SECRET`/`CLIENT_SECRET` still work when both are set but are
   deprecated; the README shows how to move them into `keys.json`.
+- The Docker image installs from the lockfile with `npm ci --omit=dev` and runs
+  as the unprivileged `node` user, which owns the `/data` directory.
 
 ## 0.1.0
 
