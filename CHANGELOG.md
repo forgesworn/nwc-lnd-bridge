@@ -2,7 +2,7 @@
 
 ## 0.1.0
 
-First published release.
+First tagged version. Run from source or Docker; not published to npm.
 
 - NIP-47 wallet service in front of an LND node over its REST API, NIP-44 v2
   only, serving one connection on one or more relays.

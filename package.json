@@ -1,6 +1,7 @@
 {
   "name": "nwc-lnd-bridge",
   "version": "0.1.0",
+  "private": true,
   "description": "Minimal NIP-47 (Nostr Wallet Connect) wallet service in front of an LND node, with an invoice-only default capability.",
   "type": "module",
   "bin": {
@@ -33,9 +34,20 @@
     "url": "https://github.com/forgesworn/nwc-lnd-bridge/issues"
   },
   "homepage": "https://github.com/forgesworn/nwc-lnd-bridge#readme",
-  "publishConfig": {
-    "provenance": true
-  },
+  "funding": [
+    {
+      "type": "individual",
+      "url": "https://github.com/sponsors/TheCryptoDonkey"
+    },
+    {
+      "type": "individual",
+      "url": "https://ko-fi.com/brays"
+    },
+    {
+      "type": "individual",
+      "url": "https://geyser.fund/project/forgesworn"
+    }
+  ],
   "license": "MIT",
   "dependencies": {
     "nostr-tools": "^2.7.0",
