@@ -22,7 +22,8 @@
  *   RELAY=wss://relay.damus.io \
  *   node nwc-bridge.mjs
  *
- * Prints the nostr+walletconnect:// URI on startup.
+ * Writes the nostr+walletconnect:// URI to DATA_DIR/nwc-uri.txt (mode 0600)
+ * and prints only that path, never the URI or either secret.
  *
  * The pure request-handling core (createHandler, mapInvoice, base64ToHex) has
  * no third-party imports and is exercised by nwc-bridge.test.mjs without a
@@ -30,7 +31,8 @@
  */
 
 import { pathToFileURL } from 'node:url'
-import { readFileSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync, existsSync } from 'node:fs'
+import { join } from 'node:path'
 
 // Invoice-only. No pay_invoice (spend), no get_balance (disclosure).
 export const DEFAULT_METHODS = ['make_invoice', 'lookup_invoice', 'list_transactions', 'get_info']
@@ -75,6 +77,60 @@ export function base64ToHex(b64) {
 }
 
 const nowSec = () => Math.floor(Date.now() / 1000)
+
+const HEX_32 = /^[0-9a-f]{64}$/i
+
+/**
+ * Write a file only its owner can read. The directory is created 0700 if it
+ * does not exist, the content goes to a temporary file created 0600 and is
+ * renamed into place, and the mode is set again in case the file pre-existed
+ * with looser permissions.
+ */
+export function writePrivateFile(path, content) {
+  const dir = path.slice(0, path.lastIndexOf('/')) || '.'
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  const temporary = `${path}.${process.pid}.tmp`
+  writeFileSync(temporary, content, { mode: 0o600 })
+  chmodSync(temporary, 0o600)
+  renameSync(temporary, path)
+  chmodSync(path, 0o600)
+  return path
+}
+
+/**
+ * Load the bridge and client secrets, creating and persisting them on first
+ * run. They live in DATA_DIR/keys.json (0600) rather than in the environment
+ * or the logs, so the connection survives restarts without anyone copying a
+ * secret out of `docker logs`.
+ *
+ * BRIDGE_SECRET and CLIENT_SECRET are still honoured when both are set, for
+ * deployments that already pin them, but nothing is written in that case.
+ */
+export function loadOrCreateKeys({ dataDir, env = {}, generate }) {
+  const fromEnv = [env.BRIDGE_SECRET, env.CLIENT_SECRET].filter(Boolean)
+  if (fromEnv.length === 1) throw new Error('set both BRIDGE_SECRET and CLIENT_SECRET, or neither')
+  if (fromEnv.length === 2) {
+    if (!fromEnv.every((value) => HEX_32.test(value))) throw new Error('BRIDGE_SECRET and CLIENT_SECRET must be 32-byte hex')
+    return { bridgeSecret: env.BRIDGE_SECRET.toLowerCase(), clientSecret: env.CLIENT_SECRET.toLowerCase(), source: 'env' }
+  }
+  const path = join(dataDir, 'keys.json')
+  if (existsSync(path)) {
+    const stored = JSON.parse(readFileSync(path, 'utf8'))
+    if (!HEX_32.test(stored.bridge_secret || '') || !HEX_32.test(stored.client_secret || '')) {
+      throw new Error(`${path} does not hold two 32-byte hex secrets`)
+    }
+    chmodSync(path, 0o600)
+    return { bridgeSecret: stored.bridge_secret, clientSecret: stored.client_secret, source: 'file', path }
+  }
+  const keys = { bridge_secret: generate(), client_secret: generate() }
+  writePrivateFile(path, `${JSON.stringify(keys, null, 2)}\n`)
+  return { bridgeSecret: keys.bridge_secret, clientSecret: keys.client_secret, source: 'new', path }
+}
+
+/** A short, loggable identifier for a public key. */
+export function fingerprint(pubkey) {
+  return `${pubkey.slice(0, 8)}…${pubkey.slice(-8)}`
+}
 
 /**
  * Tracks which relays still carry a live request subscription and calls
@@ -360,27 +416,34 @@ async function main() {
 
   const handle = createHandler({ lnd, allowedMethods, maxPayMsat, feeLimitMsat })
 
-  const bridgeSecret = process.env.BRIDGE_SECRET ? hexToBytes(process.env.BRIDGE_SECRET) : generateSecretKey()
+  const dataDir = process.env.DATA_DIR || join(process.cwd(), 'data')
+  let keys
+  try {
+    keys = loadOrCreateKeys({ dataDir, env: process.env, generate: () => bytesToHex(generateSecretKey()) })
+  } catch (err) {
+    console.error(err.message)
+    process.exit(1)
+  }
+  const bridgeSecret = hexToBytes(keys.bridgeSecret)
   const bridgePubkey = getPublicKey(bridgeSecret)
-  const clientSecret = process.env.CLIENT_SECRET ? hexToBytes(process.env.CLIENT_SECRET) : generateSecretKey()
+  const clientSecret = hexToBytes(keys.clientSecret)
   const clientPubkey = getPublicKey(clientSecret)
 
   const relayParams = relays.map((r) => `relay=${encodeURIComponent(r)}`).join('&')
-  const nwcUri = `nostr+walletconnect://${bridgePubkey}?${relayParams}&secret=${bytesToHex(clientSecret)}`
+  const uriPath = writePrivateFile(
+    join(dataDir, 'nwc-uri.txt'),
+    `nostr+walletconnect://${bridgePubkey}?${relayParams}&secret=${keys.clientSecret}\n`,
+  )
   const spends = allowedMethods.has('pay_invoice')
-  console.log('\nNWC URI:')
-  console.log(nwcUri)
+  console.log(`\nNWC URI written to ${uriPath} (owner-only). It is a capability: treat it like a password.`)
+  if (keys.source === 'new') console.log(`New connection keys written to ${keys.path}`)
+  if (keys.source === 'env') console.warn('WARN: BRIDGE_SECRET/CLIENT_SECRET in the environment are deprecated; remove them to use DATA_DIR/keys.json')
   console.log(`\nMethods: ${[...allowedMethods].join(' ')}`)
   console.log(`Capability: ${spends ? 'CAN SPEND (pay_invoice enabled)' : 'invoice-only (cannot spend)'}`)
   if (spends) console.log(`Spend limits: ${maxPayMsat} msat per payment, ${feeLimitMsat} msat fee ceiling`)
-  console.log(`Bridge pubkey: ${bridgePubkey}`)
-  console.log(`Client pubkey: ${clientPubkey}`)
+  console.log(`Wallet pubkey: ${fingerprint(bridgePubkey)}`)
   console.log(`Relays: ${relays.join(', ')}`)
   console.log(`LND: ${LND_REST_URL}\n`)
-  if (!process.env.BRIDGE_SECRET) {
-    console.log(`BRIDGE_SECRET=${bytesToHex(bridgeSecret)}`)
-    console.log(`CLIENT_SECRET=${bytesToHex(clientSecret)}\n`)
-  }
 
   const decryptRequest = (event) => {
     const key = getConversationKey(bridgeSecret, event.pubkey)

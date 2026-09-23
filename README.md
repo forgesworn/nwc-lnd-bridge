@@ -2,8 +2,8 @@
 
 A minimal NIP-47 (Nostr Wallet Connect) wallet service in front of an LND node.
 It listens for kind 23194 requests on a relay, proxies them to LND's REST API,
-and publishes kind 23195 responses. On startup it prints a
-`nostr+walletconnect://` URI.
+and publishes kind 23195 responses. On startup it writes a
+`nostr+walletconnect://` URI to an owner-only file.
 
 It is the LND analogue of
 [`nwc-phoenixd-bridge`](https://github.com/forgesworn/nwc-phoenixd-bridge): the
@@ -15,8 +15,10 @@ and the merchant backend in
 
 ## The URI is a capability. Scope it.
 
-The printed URI is a spending-and-query capability over the node it fronts.
-Treat `BRIDGE_SECRET` + `CLIENT_SECRET` like a password. Two independent guards
+The URI is a spending-and-query capability over the node it fronts. Treat it,
+and the `keys.json` it is derived from, like a password. The bridge never
+prints either: it writes them to `DATA_DIR` with mode 0600 and logs only the
+file path and a short fingerprint of the wallet pubkey. Two independent guards
 keep it safe to point at a funds-holding node:
 
 1. **Method allowlist, invoice-only by default.** With `NWC_METHODS` unset the
@@ -77,17 +79,26 @@ LND_MACAROON=$(xxd -p -c 2000 invoice.macaroon | tr -d '\n') \
 LND_CERT_PATH=/path/to/tls.cert \
 RELAY=wss://relay.damus.io \
 npm start
+cat data/nwc-uri.txt
 ```
 
 Or Docker (see `docker-compose.yml`, copy `.env.example` to `.env` first):
 
 ```sh
 docker compose up -d --build
-docker compose logs nwc-lnd-bridge   # the NWC URI is printed here
+docker compose exec nwc-lnd-bridge cat /data/nwc-uri.txt
 ```
 
-Set `BRIDGE_SECRET` and `CLIENT_SECRET` (printed on first run) in `.env` to keep
-the same URI across restarts.
+On first run the bridge generates its keys and saves them in
+`DATA_DIR/keys.json`, so the URI stays the same across restarts. Under Docker
+`DATA_DIR` is the `nwc-data` volume. To revoke the URI, stop the bridge, move
+`keys.json` out of the data directory and start it again.
+
+`BRIDGE_SECRET` and `CLIENT_SECRET` are still read if both are set, for
+deployments that already pin them, but they are deprecated. To move an existing
+URI to the data directory, write the two values into `keys.json` as
+`{"bridge_secret": "…", "client_secret": "…"}` with mode 0600, then remove them
+from the environment.
 
 ## Configuration
 
@@ -101,7 +112,8 @@ the same URI across restarts.
 | `NWC_METHODS` | invoice-only set | Space-separated method allowlist |
 | `MAX_PAY_MSAT` | none | Per-payment cap in msat. Required when `pay_invoice` is enabled |
 | `FEE_LIMIT_MSAT` | none | Routing fee ceiling per payment in msat. Required when `pay_invoice` is enabled |
-| `BRIDGE_SECRET` / `CLIENT_SECRET` | random | Hex 32-byte keys; set to persist the URI |
+| `DATA_DIR` | `./data` (`/data` in Docker) | Where `keys.json` and `nwc-uri.txt` are written, both mode 0600 |
+| `BRIDGE_SECRET` / `CLIENT_SECRET` | unset | Deprecated. Hex 32-byte keys; used instead of `keys.json` only when both are set |
 
 ## Method map
 

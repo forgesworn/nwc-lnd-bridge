@@ -24,10 +24,14 @@ services:
       - NWC_METHODS=${NWC_METHODS:-}           # blank = invoice-only default
       - MAX_PAY_MSAT=${MAX_PAY_MSAT:-}         # required with pay_invoice
       - FEE_LIMIT_MSAT=${FEE_LIMIT_MSAT:-}     # required with pay_invoice
-      - BRIDGE_SECRET=${BRIDGE_SECRET:-}
-      - CLIENT_SECRET=${CLIENT_SECRET:-}
+      - DATA_DIR=/data                         # keys.json + nwc-uri.txt, mode 0600
+    volumes:
+      - nwc-data:/data
 #    networks:
 #      - mint
+
+volumes:
+  nwc-data:
 
 #networks:
 #  mint:

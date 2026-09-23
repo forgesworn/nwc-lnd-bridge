@@ -3,7 +3,10 @@ import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
-import { createHandler, mapInvoice, base64ToHex, parseRelays, allowUnverifiedTls, watchRelayLiveness, parseMsat, DEFAULT_METHODS } from './nwc-bridge.mjs'
+import { mkdtempSync, readFileSync, statSync, writeFileSync, existsSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { createHandler, mapInvoice, base64ToHex, parseRelays, allowUnverifiedTls, watchRelayLiveness, parseMsat, loadOrCreateKeys, writePrivateFile, fingerprint, DEFAULT_METHODS } from './nwc-bridge.mjs'
 
 const b64 = (byte) => Buffer.alloc(32, byte).toString('base64')
 const hex = (byte) => byte.toString(16).padStart(2, '0').repeat(32)
@@ -29,6 +32,7 @@ function bridgeTestEnv(extra = {}) {
     PATH: process.env.PATH,
     LND_REST_URL: 'https://127.0.0.1:1',
     LND_MACAROON: 'ab'.repeat(16),
+    DATA_DIR: mkdtempSync(join(tmpdir(), 'nwc-bridge-')),
     ...extra,
   }
 }
@@ -333,4 +337,72 @@ test('the bridge exits non-zero when its only relay drops', async () => {
   server.close()
   assert.equal(code, 1, `expected exit 1, got ${code}; stderr: ${stderr}`)
   assert.match(stderr, /All relay subscriptions closed/)
+})
+
+const modeOf = (path) => statSync(path).mode & 0o777
+
+test('loadOrCreateKeys persists new secrets owner-only and reuses them', () => {
+  const dataDir = join(mkdtempSync(join(tmpdir(), 'nwc-keys-')), 'nested')
+  let n = 0
+  const generate = () => hex(++n)
+  const first = loadOrCreateKeys({ dataDir, generate })
+  assert.equal(first.source, 'new')
+  assert.equal(modeOf(join(dataDir, 'keys.json')), 0o600)
+  assert.equal(modeOf(dataDir), 0o700)
+  const second = loadOrCreateKeys({ dataDir, generate })
+  assert.equal(second.source, 'file')
+  assert.equal(second.bridgeSecret, first.bridgeSecret)
+  assert.equal(second.clientSecret, first.clientSecret)
+})
+
+test('loadOrCreateKeys honours both env secrets, refuses one, and refuses bad hex', () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'nwc-keys-'))
+  const generate = () => { throw new Error('should not generate') }
+  const keys = loadOrCreateKeys({ dataDir, env: { BRIDGE_SECRET: hex(1), CLIENT_SECRET: hex(2) }, generate })
+  assert.equal(keys.source, 'env')
+  assert.equal(existsSync(join(dataDir, 'keys.json')), false)
+  assert.throws(() => loadOrCreateKeys({ dataDir, env: { BRIDGE_SECRET: hex(1) }, generate }), /both/)
+  assert.throws(() => loadOrCreateKeys({ dataDir, env: { BRIDGE_SECRET: 'zz', CLIENT_SECRET: hex(2) }, generate }), /hex/)
+})
+
+test('writePrivateFile tightens a file that already existed with loose permissions', () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'nwc-uri-')), 'nwc-uri.txt')
+  writeFileSync(path, 'old', { mode: 0o644 })
+  writePrivateFile(path, 'new')
+  assert.equal(readFileSync(path, 'utf8'), 'new')
+  assert.equal(modeOf(path), 0o600)
+})
+
+test('fingerprint shortens a pubkey', () => {
+  assert.equal(fingerprint(hex(0xab)), 'abababab…abababab')
+})
+
+test('the running bridge writes the URI to an owner-only file and never logs a secret', async () => {
+  const server = await startTestRelay((message, relay) => {
+    if (message[0] === 'EVENT') relay.send(['OK', message[1].id, true, ''])
+  })
+  const env = bridgeTestEnv({ RELAY: server.url })
+  const child = spawn(process.execPath, ['nwc-bridge.mjs'], {
+    cwd: new URL('.', import.meta.url), env, stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  let output = ''
+  child.stdout.on('data', (chunk) => { output += chunk })
+  child.stderr.on('data', (chunk) => { output += chunk })
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`bridge did not start: ${output}`)), 10_000)
+    child.stdout.on('data', () => { if (output.includes('Listening')) { clearTimeout(timer); resolve() } })
+  })
+  child.kill('SIGTERM')
+  await new Promise((resolve) => child.on('exit', resolve))
+  server.close()
+
+  const uriPath = join(env.DATA_DIR, 'nwc-uri.txt')
+  const keys = JSON.parse(readFileSync(join(env.DATA_DIR, 'keys.json'), 'utf8'))
+  assert.equal(modeOf(uriPath), 0o600)
+  assert.equal(modeOf(join(env.DATA_DIR, 'keys.json')), 0o600)
+  assert.match(readFileSync(uriPath, 'utf8'), new RegExp(`^nostr\\+walletconnect://[0-9a-f]{64}\\?relay=.+&secret=${keys.client_secret}\\n$`))
+  assert.ok(output.includes(uriPath), 'the URI file path is printed')
+  assert.ok(!output.includes(keys.client_secret), 'the client secret must not be logged')
+  assert.ok(!output.includes(keys.bridge_secret), 'the bridge secret must not be logged')
+  assert.ok(!output.includes('nostr+walletconnect://'), 'the URI must not be logged')
 })

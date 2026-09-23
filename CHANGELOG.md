@@ -12,6 +12,12 @@
   `QUOTA_EXCEEDED`, passes the fee ceiling to LND as `fee_limit`, and pays an
   amountless invoice only for an explicit, capped NIP-47 `amount`. It also
   reports `fees_paid`.
+- Stop logging secrets. The URI and both keys were printed at every start and
+  the README said to read them from `docker logs`. The keys now live in
+  `DATA_DIR/keys.json` and the URI in `DATA_DIR/nwc-uri.txt`, both mode 0600,
+  and only the file path and a wallet pubkey fingerprint are logged.
+  `BRIDGE_SECRET`/`CLIENT_SECRET` still work when both are set but are
+  deprecated; the README shows how to move them into `keys.json`.
 
 ## 0.1.0
 
