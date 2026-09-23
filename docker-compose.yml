@@ -15,6 +15,8 @@ services:
       dockerfile: Dockerfile.nwc
     container_name: nwc-lnd-bridge
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # Docker Desktop has it; Linux needs this
     environment:
       - LND_REST_URL=${LND_REST_URL:-https://host.docker.internal:8080}
       - LND_MACAROON=${LND_MACAROON}          # hex; invoice-only for a funds node
@@ -22,10 +24,16 @@ services:
       - LND_TLS_INSECURE=${LND_TLS_INSECURE:-}
       - RELAY=${NWC_RELAY:-wss://relay.damus.io}
       - NWC_METHODS=${NWC_METHODS:-}           # blank = invoice-only default
-      - BRIDGE_SECRET=${BRIDGE_SECRET:-}
-      - CLIENT_SECRET=${CLIENT_SECRET:-}
+      - MAX_PAY_MSAT=${MAX_PAY_MSAT:-}         # required with pay_invoice
+      - FEE_LIMIT_MSAT=${FEE_LIMIT_MSAT:-}     # required with pay_invoice
+      - DATA_DIR=/data                         # keys.json + nwc-uri.txt, mode 0600
+    volumes:
+      - nwc-data:/data
 #    networks:
 #      - mint
+
+volumes:
+  nwc-data:
 
 #networks:
 #  mint:

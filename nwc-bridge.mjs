@@ -3,14 +3,11 @@
  * Minimal NWC-to-LND bridge
  *
  * Listens for NIP-47 (kind 23194) wallet requests on a relay, proxies them to
- * an LND REST API, and publishes responses (kind 23195). It is the LND analogue
- * of nwc-phoenixd-bridge: same NWC/relay/NIP-44 plumbing, a different wallet
- * backend.
+ * an LND REST API, and publishes responses (kind 23195).
  *
  * The emitted `nostr+walletconnect://` URI is a capability over the node it
  * fronts. This bridge scopes that capability with a method allowlist that
- * DEFAULTS TO INVOICE-ONLY: `make_invoice lookup_invoice list_transactions
- * get_info`. `pay_invoice` and `get_balance` are opt-in via NWC_METHODS, so a
+ * DEFAULTS TO INVOICE-ONLY: `make_invoice lookup_invoice get_info`. `pay_invoice` and `get_balance` are opt-in via NWC_METHODS, so a
  * URI pointed at a funds-holding node cannot spend or disclose its balance
  * unless you deliberately allow it. Prefer an invoice-baked macaroon as a
  * second, independent guard.
@@ -22,7 +19,8 @@
  *   RELAY=wss://relay.damus.io \
  *   node nwc-bridge.mjs
  *
- * Prints the nostr+walletconnect:// URI on startup.
+ * Writes the nostr+walletconnect:// URI to DATA_DIR/nwc-uri.txt (mode 0600)
+ * and prints only that path, never the URI or either secret.
  *
  * The pure request-handling core (createHandler, mapInvoice, base64ToHex) has
  * no third-party imports and is exercised by nwc-bridge.test.mjs without a
@@ -30,21 +28,60 @@
  */
 
 import { pathToFileURL } from 'node:url'
-import { readFileSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync, existsSync } from 'node:fs'
+import { join } from 'node:path'
 
 // Invoice-only. No pay_invoice (spend), no get_balance (disclosure).
-export const DEFAULT_METHODS = ['make_invoice', 'lookup_invoice', 'list_transactions', 'get_info']
+export const DEFAULT_METHODS = ['make_invoice', 'lookup_invoice', 'get_info']
+
+// Everything this bridge implements. list_transactions (extension 05) is not
+// here: answering it honestly means filtering by type, time and paid state and
+// merging outgoing payments with incoming invoices, and serving part of that
+// would mislead a client that trusts the advertisement.
+export const SUPPORTED_METHODS = ['make_invoice', 'lookup_invoice', 'get_info', 'get_balance', 'pay_invoice']
+
+/**
+ * Parse NWC_METHODS. Blank means the invoice-only default. An unsupported name
+ * is an error rather than something to advertise and then fail on.
+ */
+export function parseMethods(input) {
+  const methods = String(input || '').split(/[\s,]+/).filter(Boolean)
+  if (methods.length === 0) return new Set(DEFAULT_METHODS)
+  const unsupported = methods.filter((method) => !SUPPORTED_METHODS.includes(method))
+  if (unsupported.length > 0) {
+    throw new Error(`NWC_METHODS lists unsupported methods: ${unsupported.join(' ')} (supported: ${SUPPORTED_METHODS.join(' ')})`)
+  }
+  return new Set(methods)
+}
+
+export function isLoopbackHost(host) {
+  return host === 'localhost' || host === '[::1]' || /^127\.\d+\.\d+\.\d+$/.test(host)
+}
+
+/**
+ * Why a relay URL is refused, or undefined if it is acceptable. Plain ws://
+ * is only allowed on loopback: the requests are NIP-44 encrypted, but their
+ * metadata (who, when, how often) and the relay's authenticity are not, and a
+ * wallet service has no reason to give those away.
+ */
+export function relayRejection(url) {
+  let parsed
+  try { parsed = new URL(url) } catch { return 'not a URL' }
+  if (parsed.protocol === 'wss:') return undefined
+  if (parsed.protocol === 'ws:') return isLoopbackHost(parsed.hostname) ? undefined : 'ws:// is only allowed on loopback; use wss://'
+  return 'not a ws(s):// URL'
+}
 
 // RELAY may be a single URL or a whitespace/comma-separated list. Serving the
 // connection on several relays makes it resilient: a request delivered on any
 // one is enough, so no single relay is a point of failure. Dedupes and drops
-// anything that is not a ws(s):// URL.
+// anything relayRejection refuses; main() refuses to start if any was dropped.
 export function parseRelays(input) {
   const seen = new Set()
   const out = []
   for (const raw of String(input || '').split(/[\s,]+/)) {
     const url = raw.trim()
-    if (!url || !/^wss?:\/\//i.test(url) || seen.has(url)) continue
+    if (!url || relayRejection(url) || seen.has(url)) continue
     seen.add(url)
     out.push(url)
   }
@@ -59,13 +96,64 @@ export function allowUnverifiedTls(lndUrl, insecureFlag) {
   if (insecureFlag === '1') return true
   let host
   try { host = new URL(lndUrl).hostname } catch { return false }
-  return host === 'localhost' || host === '[::1]' || /^127\.\d+\.\d+\.\d+$/.test(host)
+  return isLoopbackHost(host)
 }
 
 export function nwcError(code, message) {
   const error = new Error(message)
   error.code = code
+  error.nwc = true
   return error
+}
+
+const MAX_CLIENT_MESSAGE = 256
+
+/**
+ * The error half of a NIP-47 response. Only errors this bridge raised on
+ * purpose pass their code and message through. Anything else (a Node system
+ * error, a JSON parse failure, a bug) could carry hostnames, paths or node
+ * internals, so the client gets a bare INTERNAL. Its `code` is never trusted
+ * either: Node's own errors carry codes like ECONNREFUSED.
+ */
+export function responseError(err) {
+  if (err && err.nwc === true) {
+    return { code: err.code, message: String(err.message).slice(0, MAX_CLIENT_MESSAGE) }
+  }
+  return { code: 'INTERNAL', message: 'internal error' }
+}
+
+/**
+ * LND REST client. A failure reaches the NWC client as a status code only.
+ * LND's error bodies name internal state (channel ids, peer addresses, invoice
+ * details) and belong in the operator's log, trimmed, not in a response.
+ */
+export function createLndClient({ baseUrl, macaroon, dispatcher, fetchImpl = fetch, log = console.error }) {
+  return async (httpMethod, path, body) => {
+    const opts = { method: httpMethod, headers: { 'Grpc-Metadata-macaroon': macaroon }, dispatcher }
+    if (body !== undefined) {
+      opts.headers['Content-Type'] = 'application/json'
+      opts.body = JSON.stringify(body)
+    }
+    const route = path.split('/').slice(0, 3).join('/')
+    let res, text
+    try {
+      res = await fetchImpl(`${baseUrl}${path}`, opts)
+      text = await res.text()
+    } catch (err) {
+      log(`lnd ${httpMethod} ${route}: request failed: ${String((err && err.message) || err).slice(0, 200)}`)
+      throw nwcError('INTERNAL', 'LND request failed')
+    }
+    if (!res.ok) {
+      log(`lnd ${httpMethod} ${route}: HTTP ${res.status}: ${text.slice(0, 200)}`)
+      throw nwcError('INTERNAL', `LND request failed (HTTP ${res.status})`)
+    }
+    try {
+      return text ? JSON.parse(text) : {}
+    } catch {
+      log(`lnd ${httpMethod} ${route}: unreadable response`)
+      throw nwcError('INTERNAL', 'LND returned an unreadable response')
+    }
+  }
 }
 
 // LND REST encodes hashes and preimages as standard base64; NWC wants hex.
@@ -75,6 +163,97 @@ export function base64ToHex(b64) {
 }
 
 const nowSec = () => Math.floor(Date.now() / 1000)
+
+const HEX_32 = /^[0-9a-f]{64}$/i
+
+/**
+ * Write a file only its owner can read. The directory is created 0700 if it
+ * does not exist, the content goes to a temporary file created 0600 and is
+ * renamed into place, and the mode is set again in case the file pre-existed
+ * with looser permissions.
+ */
+export function writePrivateFile(path, content) {
+  const dir = path.slice(0, path.lastIndexOf('/')) || '.'
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  const temporary = `${path}.${process.pid}.tmp`
+  writeFileSync(temporary, content, { mode: 0o600 })
+  chmodSync(temporary, 0o600)
+  renameSync(temporary, path)
+  chmodSync(path, 0o600)
+  return path
+}
+
+/**
+ * Load the bridge and client secrets, creating and persisting them on first
+ * run. They live in DATA_DIR/keys.json (0600) rather than in the environment
+ * or the logs, so the connection survives restarts without anyone copying a
+ * secret out of `docker logs`.
+ *
+ * BRIDGE_SECRET and CLIENT_SECRET are still honoured when both are set, for
+ * deployments that already pin them, but nothing is written in that case.
+ */
+export function loadOrCreateKeys({ dataDir, env = {}, generate }) {
+  const fromEnv = [env.BRIDGE_SECRET, env.CLIENT_SECRET].filter(Boolean)
+  if (fromEnv.length === 1) throw new Error('set both BRIDGE_SECRET and CLIENT_SECRET, or neither')
+  if (fromEnv.length === 2) {
+    if (!fromEnv.every((value) => HEX_32.test(value))) throw new Error('BRIDGE_SECRET and CLIENT_SECRET must be 32-byte hex')
+    return { bridgeSecret: env.BRIDGE_SECRET.toLowerCase(), clientSecret: env.CLIENT_SECRET.toLowerCase(), source: 'env' }
+  }
+  const path = join(dataDir, 'keys.json')
+  if (existsSync(path)) {
+    const stored = JSON.parse(readFileSync(path, 'utf8'))
+    if (!HEX_32.test(stored.bridge_secret || '') || !HEX_32.test(stored.client_secret || '')) {
+      throw new Error(`${path} does not hold two 32-byte hex secrets`)
+    }
+    chmodSync(path, 0o600)
+    return { bridgeSecret: stored.bridge_secret, clientSecret: stored.client_secret, source: 'file', path }
+  }
+  const keys = { bridge_secret: generate(), client_secret: generate() }
+  writePrivateFile(path, `${JSON.stringify(keys, null, 2)}\n`)
+  return { bridgeSecret: keys.bridge_secret, clientSecret: keys.client_secret, source: 'new', path }
+}
+
+/**
+ * NIP-40: a request whose `expiration` tag is in the past must not be acted
+ * on. NWC clients set it so that a request delayed on a relay, or replayed
+ * later, cannot pay or mint after the client has stopped waiting for it.
+ */
+export function isExpired(event, now = nowSec()) {
+  const tag = event.tags.find((t) => t[0] === 'expiration')
+  if (!tag) return false
+  const expiresAt = Number(tag[1])
+  return !Number.isFinite(expiresAt) || expiresAt <= now
+}
+
+/** A short, loggable identifier for a public key. */
+export function fingerprint(pubkey) {
+  return `${pubkey.slice(0, 8)}…${pubkey.slice(-8)}`
+}
+
+/**
+ * Tracks which relays still carry a live request subscription and calls
+ * `onAllClosed` once, when the last one goes.
+ *
+ * nostr-tools does not reconnect a Relay by default, and a dropped connection
+ * closes its subscriptions. Without this the bridge would stay up, deaf to
+ * every request, for as long as the process lives. Exiting instead hands
+ * recovery to the supervisor (Docker's `restart: unless-stopped`, systemd),
+ * and a fresh start reconnects, re-subscribes and republishes the kind 13194
+ * info event. A subscription the relay itself closes (a CLOSED message) is
+ * just as deaf, so it counts the same as a dropped connection.
+ */
+export function watchRelayLiveness(urls, onAllClosed) {
+  const live = new Set(urls)
+  let fired = live.size === 0
+  return {
+    closed(url) {
+      if (!live.delete(url) || fired || live.size > 0) return
+      fired = true
+      onAllClosed()
+    },
+    get live() { return [...live] },
+  }
+}
 
 // Map an LND invoice object (AddInvoice lookup / ListInvoices element) onto a
 // NIP-47 transaction. `state` is set explicitly: a NIP-47 client keys
@@ -112,13 +291,31 @@ function normalizePaymentHash(params) {
 }
 
 /**
+ * Parse an optional milli-satoshi setting. Returns undefined when unset and
+ * throws on anything that is not a non-negative safe integer, so a typo can
+ * never silently lift a spend limit.
+ */
+export function parseMsat(value, name) {
+  if (value === undefined || value === '') return undefined
+  const text = String(value).trim()
+  const parsed = Number(text)
+  if (!/^\d+$/.test(text) || !Number.isSafeInteger(parsed)) {
+    throw new Error(`${name} must be a whole number of millisatoshis`)
+  }
+  return parsed
+}
+
+/**
  * Build the NWC method dispatcher.
  *
  * @param lnd  async (httpMethod, path, body?) => parsed JSON. Injected so the
  *             handler is testable without a real node.
  * @param allowedMethods  iterable of permitted NIP-47 methods.
+ * @param maxPayMsat  per-payment cap for pay_invoice, invoice amount only.
+ * @param feeLimitMsat  routing fee ceiling passed to LND on every payment.
+ *             pay_invoice refuses to run unless both are set.
  */
-export function createHandler({ lnd, allowedMethods }) {
+export function createHandler({ lnd, allowedMethods, maxPayMsat, feeLimitMsat }) {
   const allow = allowedMethods instanceof Set ? allowedMethods : new Set(allowedMethods)
 
   return async function handle(method, params = {}) {
@@ -160,6 +357,16 @@ export function createHandler({ lnd, allowedMethods }) {
         // Omit value_msat for a zero amount so LND mints an amountless invoice
         // rather than rejecting it.
         if (amountMsat > 0) body.value_msat = String(amountMsat)
+        // LND commits to description_hash in the invoice's h field. REST takes
+        // the 32 bytes as base64; NIP-47 sends them as hex.
+        let descriptionHash
+        if (params.description_hash !== undefined && params.description_hash !== null && params.description_hash !== '') {
+          if (typeof params.description_hash !== 'string' || !HEX_32.test(params.description_hash)) {
+            throw nwcError('OTHER', 'description_hash must be 32-byte hex')
+          }
+          descriptionHash = params.description_hash.toLowerCase()
+          body.description_hash = Buffer.from(descriptionHash, 'hex').toString('base64')
+        }
         const inv = await lnd('POST', '/v1/invoices', body)
         return {
           type: 'incoming',
@@ -167,6 +374,7 @@ export function createHandler({ lnd, allowedMethods }) {
           payment_hash: base64ToHex(inv.r_hash),
           amount: amountMsat,
           ...(params.description ? { description: params.description } : {}),
+          ...(descriptionHash ? { description_hash: descriptionHash } : {}),
           created_at: nowSec(),
         }
       }
@@ -177,15 +385,47 @@ export function createHandler({ lnd, allowedMethods }) {
         return mapInvoice(inv)
       }
 
-      case 'list_transactions': {
-        const limit = Number(params.limit || 10)
-        const query = new URLSearchParams({ num_max_invoices: String(limit), reversed: 'true' })
-        const res = await lnd('GET', `/v1/invoices?${query.toString()}`)
-        return { transactions: (res.invoices || []).map(mapInvoice) }
-      }
-
       case 'pay_invoice': {
-        const res = await lnd('POST', '/v1/channels/transactions', { payment_request: params.invoice })
+        // Fail closed: a spending bridge with no configured limits pays nothing.
+        if (!Number.isSafeInteger(maxPayMsat) || maxPayMsat <= 0 ||
+            !Number.isSafeInteger(feeLimitMsat) || feeLimitMsat < 0) {
+          throw nwcError('RESTRICTED', 'pay_invoice is not configured with spend limits')
+        }
+        const invoice = params.invoice
+        if (typeof invoice !== 'string' || invoice.length === 0 || invoice.length > 20_000) {
+          throw nwcError('OTHER', 'pay_invoice requires an invoice')
+        }
+        const requested = params.amount
+        if (requested !== undefined && (!Number.isSafeInteger(requested) || requested <= 0)) {
+          throw nwcError('OTHER', 'amount must be a positive whole number of millisatoshis')
+        }
+        // Ask the node what the invoice is for, rather than trusting the
+        // caller, so the cap applies to what would actually be paid.
+        const decoded = await lnd('GET', `/v1/payreq/${encodeURIComponent(invoice)}`)
+        const invoiceMsat = decoded.num_msat && decoded.num_msat !== '0'
+          ? Number(decoded.num_msat)
+          : Number(decoded.num_satoshis || 0) * 1000
+        let amountMsat
+        if (invoiceMsat > 0) {
+          if (requested !== undefined && requested !== invoiceMsat) {
+            throw nwcError('OTHER', 'amount does not match the invoice amount')
+          }
+          amountMsat = invoiceMsat
+        } else {
+          if (requested === undefined) {
+            throw nwcError('OTHER', 'an amountless invoice needs an amount')
+          }
+          amountMsat = requested
+        }
+        if (amountMsat > maxPayMsat) {
+          throw nwcError('QUOTA_EXCEEDED', `payment of ${amountMsat} msat exceeds this bridge's per-payment limit of ${maxPayMsat} msat`)
+        }
+        const body = {
+          payment_request: invoice,
+          fee_limit: { fixed_msat: String(feeLimitMsat) },
+          ...(invoiceMsat > 0 ? {} : { amt_msat: String(amountMsat) }),
+        }
+        const res = await lnd('POST', '/v1/channels/transactions', body)
         // LND reports a routing failure as payment_error with no preimage. The
         // preimage is the only proof of settlement, so its absence is never a
         // success: a definite failure throws PAYMENT_FAILED, a silent absence is
@@ -197,7 +437,8 @@ export function createHandler({ lnd, allowedMethods }) {
         if (!preimage) {
           throw nwcError('OTHER', 'payment returned no preimage, outcome unknown, reconcile before retrying')
         }
-        return { preimage }
+        const fees = res.payment_route && res.payment_route.total_fees_msat
+        return { preimage, ...(fees !== undefined ? { fees_paid: Number(fees) } : {}) }
       }
 
       default:
@@ -220,13 +461,25 @@ async function main() {
 
   const LND_REST_URL = (process.env.LND_REST_URL || 'https://127.0.0.1:8080').replace(/\/$/, '')
   const LND_MACAROON = process.env.LND_MACAROON
-  const relays = parseRelays(process.env.RELAY || 'wss://relay.damus.io')
-  if (relays.length === 0) {
-    console.error('RELAY must contain at least one ws:// or wss:// URL')
+  const relayInput = process.env.RELAY || 'wss://relay.damus.io'
+  const refused = String(relayInput).split(/[\s,]+/).filter(Boolean)
+    .map((url) => [url, relayRejection(url)]).filter(([, reason]) => reason)
+  if (refused.length > 0) {
+    for (const [url, reason] of refused) console.error(`RELAY ${url} refused: ${reason}`)
     process.exit(1)
   }
-  const methods = (process.env.NWC_METHODS || DEFAULT_METHODS.join(' ')).split(/\s+/).filter(Boolean)
-  const allowedMethods = new Set(methods)
+  const relays = parseRelays(relayInput)
+  if (relays.length === 0) {
+    console.error('RELAY must contain at least one wss:// URL')
+    process.exit(1)
+  }
+  let allowedMethods
+  try {
+    allowedMethods = parseMethods(process.env.NWC_METHODS)
+  } catch (err) {
+    console.error(err.message)
+    process.exit(1)
+  }
 
   if (!LND_MACAROON || !/^[0-9a-f]+$/i.test(LND_MACAROON)) {
     console.error('LND_MACAROON is required and must be hex (bake an invoice-only macaroon for a funds node)')
@@ -250,40 +503,51 @@ async function main() {
   const dispatcher = new Agent({ connect: caPem ? { ca: caPem } : { rejectUnauthorized: false } })
   if (!caPem) console.warn('WARNING: no LND_CERT(_PATH) given, TLS verification is OFF (localhost/docker only)')
 
-  const lnd = async (httpMethod, path, body) => {
-    const opts = { method: httpMethod, headers: { 'Grpc-Metadata-macaroon': LND_MACAROON }, dispatcher }
-    if (body !== undefined) {
-      opts.headers['Content-Type'] = 'application/json'
-      opts.body = JSON.stringify(body)
-    }
-    const res = await fetch(`${LND_REST_URL}${path}`, opts)
-    const text = await res.text()
-    if (!res.ok) throw nwcError('INTERNAL', `lnd ${path}: ${res.status} ${text}`)
-    return text ? JSON.parse(text) : {}
+  const lnd = createLndClient({ baseUrl: LND_REST_URL, macaroon: LND_MACAROON, dispatcher })
+
+  let maxPayMsat, feeLimitMsat
+  try {
+    maxPayMsat = parseMsat(process.env.MAX_PAY_MSAT, 'MAX_PAY_MSAT')
+    feeLimitMsat = parseMsat(process.env.FEE_LIMIT_MSAT, 'FEE_LIMIT_MSAT')
+  } catch (err) {
+    console.error(err.message)
+    process.exit(1)
+  }
+  if (allowedMethods.has('pay_invoice') && (!maxPayMsat || feeLimitMsat === undefined)) {
+    console.error('pay_invoice is enabled: set MAX_PAY_MSAT (per-payment cap) and FEE_LIMIT_MSAT (routing fee ceiling)')
+    process.exit(1)
   }
 
-  const handle = createHandler({ lnd, allowedMethods })
+  const handle = createHandler({ lnd, allowedMethods, maxPayMsat, feeLimitMsat })
 
-  const bridgeSecret = process.env.BRIDGE_SECRET ? hexToBytes(process.env.BRIDGE_SECRET) : generateSecretKey()
+  const dataDir = process.env.DATA_DIR || join(process.cwd(), 'data')
+  let keys
+  try {
+    keys = loadOrCreateKeys({ dataDir, env: process.env, generate: () => bytesToHex(generateSecretKey()) })
+  } catch (err) {
+    console.error(err.message)
+    process.exit(1)
+  }
+  const bridgeSecret = hexToBytes(keys.bridgeSecret)
   const bridgePubkey = getPublicKey(bridgeSecret)
-  const clientSecret = process.env.CLIENT_SECRET ? hexToBytes(process.env.CLIENT_SECRET) : generateSecretKey()
+  const clientSecret = hexToBytes(keys.clientSecret)
   const clientPubkey = getPublicKey(clientSecret)
 
   const relayParams = relays.map((r) => `relay=${encodeURIComponent(r)}`).join('&')
-  const nwcUri = `nostr+walletconnect://${bridgePubkey}?${relayParams}&secret=${bytesToHex(clientSecret)}`
+  const uriPath = writePrivateFile(
+    join(dataDir, 'nwc-uri.txt'),
+    `nostr+walletconnect://${bridgePubkey}?${relayParams}&secret=${keys.clientSecret}\n`,
+  )
   const spends = allowedMethods.has('pay_invoice')
-  console.log('\nNWC URI:')
-  console.log(nwcUri)
+  console.log(`\nNWC URI written to ${uriPath} (owner-only). It is a capability: treat it like a password.`)
+  if (keys.source === 'new') console.log(`New connection keys written to ${keys.path}`)
+  if (keys.source === 'env') console.warn('WARN: BRIDGE_SECRET/CLIENT_SECRET in the environment are deprecated; remove them to use DATA_DIR/keys.json')
   console.log(`\nMethods: ${[...allowedMethods].join(' ')}`)
   console.log(`Capability: ${spends ? 'CAN SPEND (pay_invoice enabled)' : 'invoice-only (cannot spend)'}`)
-  console.log(`Bridge pubkey: ${bridgePubkey}`)
-  console.log(`Client pubkey: ${clientPubkey}`)
+  if (spends) console.log(`Spend limits: ${maxPayMsat} msat per payment, ${feeLimitMsat} msat fee ceiling`)
+  console.log(`Wallet pubkey: ${fingerprint(bridgePubkey)}`)
   console.log(`Relays: ${relays.join(', ')}`)
   console.log(`LND: ${LND_REST_URL}\n`)
-  if (!process.env.BRIDGE_SECRET) {
-    console.log(`BRIDGE_SECRET=${bytesToHex(bridgeSecret)}`)
-    console.log(`CLIENT_SECRET=${bytesToHex(clientSecret)}\n`)
-  }
 
   const decryptRequest = (event) => {
     const key = getConversationKey(bridgeSecret, event.pubkey)
@@ -292,7 +556,7 @@ async function main() {
   const buildResponse = (requestEvent, resultType, result, error) => {
     const key = getConversationKey(bridgeSecret, requestEvent.pubkey)
     const payload = { result_type: resultType }
-    if (error) payload.error = { code: error.code || 'OTHER', message: error.message }
+    if (error) payload.error = responseError(error)
     else payload.result = result
     return finalizeEvent({
       kind: 23195,
@@ -333,7 +597,6 @@ async function main() {
   // NIP-44-only client refuses a wallet that advertises no encryption tag, so
   // this is required for discovery, not optional. Advertise exactly the allowlist.
   const infoTags = [['encryption', 'nip44_v2']]
-  if (allowedMethods.has('list_transactions')) infoTags.push(['extensions', '05'])
   const infoEvent = finalizeEvent({
     kind: 13194,
     created_at: nowSec(),
@@ -352,6 +615,10 @@ async function main() {
     // re-check make the client secret a real credential; without them a
     // pay-enabled URI would honour anyone.
     if (event.pubkey !== clientPubkey) return
+    if (isExpired(event)) {
+      console.warn('  -> dropped an expired request (NIP-40)')
+      return
+    }
     if (seen.has(event.id)) return
     seen.add(event.id)
     if (seen.size > 5000) seen.clear()
@@ -372,16 +639,33 @@ async function main() {
     }
   }
 
+  let shuttingDown = false
+  const liveness = watchRelayLiveness(conns.map(({ url }) => url), () => {
+    if (shuttingDown) return
+    console.error('All relay subscriptions closed; exiting so the supervisor restarts the bridge')
+    process.exit(1)
+  })
+
   const filter = { kinds: [23194], authors: [clientPubkey], '#p': [bridgePubkey], since: nowSec() - 10 }
-  const subs = conns.map(({ relay }) => relay.subscribe([filter], { onevent: onRequest }))
+  const subs = conns.map(({ url, relay }) => relay.subscribe([filter], {
+    onevent: onRequest,
+    onclose: (reason) => {
+      if (shuttingDown) return
+      console.warn(`WARN: subscription on ${url} closed: ${reason || 'no reason given'}`)
+      liveness.closed(url)
+    },
+  }))
 
   console.log('Listening for NWC requests...\n')
-  process.on('SIGINT', () => {
+  const shutdown = () => {
+    shuttingDown = true
     console.log('\nShutting down...')
     for (const s of subs) { try { s.close() } catch { /* ignore */ } }
     for (const { relay } of conns) { try { relay.close() } catch { /* ignore */ } }
     process.exit(0)
-  })
+  }
+  process.on('SIGINT', shutdown)
+  process.on('SIGTERM', shutdown)
 }
 
 if (isMain) {
