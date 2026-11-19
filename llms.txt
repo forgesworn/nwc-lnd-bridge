@@ -1,0 +1,14 @@
+# nwc-lnd-bridge
+
+> Self-hosted NIP-47 wallet service for LND with invoice-only default capabilities.
+
+## Documentation
+
+- [Install and operate](https://github.com/forgesworn/nwc-lnd-bridge/blob/main/README.md): Local setup, wallet permissions and service configuration.
+
+## ForgeSworn ecosystem
+
+- [ForgeSworn library guide](https://forgesworn.dev/llms.txt): Find related libraries, tools and integration guides by task and runtime.
+- [ForgeSworn on GitHub](https://github.com/forgesworn): Browse the organisation’s public repositories.
+- [Project source](https://github.com/forgesworn/nwc-lnd-bridge): Canonical source repository, documentation and release information.
+- [nwc-kit](https://github.com/forgesworn/nwc-kit): Use the TypeScript NIP-47 client to call the wallet service.
